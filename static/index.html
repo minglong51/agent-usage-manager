@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>agent usage manager</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+         margin: 0; background: #0d1117; color: #c9d1d9; }
+  header { padding: 14px 20px; border-bottom: 1px solid #21262d;
+           display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; }
+  .meta { color: #8b949e; font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         margin-right: 6px; vertical-align: middle; }
+  .live { background: #3fb950; } .dead { background: #f85149; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #161b22;
+           white-space: nowrap; }
+  th { color: #8b949e; font-weight: 600; font-size: 12px; text-transform: uppercase;
+       letter-spacing: .04em; }
+  td.cmd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+           max-width: 380px; color: #8b949e; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .label { background: #1f6feb33; color: #79c0ff; padding: 1px 7px;
+           border-radius: 10px; font-size: 12px; }
+  .bar { height: 5px; background: #21262d; border-radius: 3px; margin-top: 3px; }
+  .bar > i { display: block; height: 100%; border-radius: 3px; background: #d29922; }
+  button.kill { background: #da3633; color: #fff; border: 0; padding: 5px 12px;
+                border-radius: 6px; cursor: pointer; font: inherit; }
+  button.kill:hover { background: #f85149; }
+  button.kill:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
+  .empty { padding: 40px 20px; color: #8b949e; }
+  .err { color: #f85149; }
+</style>
+</head>
+<body>
+<header>
+  <h1>agent usage manager</h1>
+  <span class="meta" id="meta">loading…</span>
+  <span class="meta" id="err"></span>
+</header>
+<table>
+  <thead>
+    <tr>
+      <th>agent</th><th>pid</th><th>status</th>
+      <th class="num">cpu %</th><th class="num">mem MB</th>
+      <th class="num">gpu MB</th><th class="num">uptime</th>
+      <th>command</th><th></th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+<div class="empty" id="empty" hidden>No matching agents running.</div>
+
+<script>
+const rows = document.getElementById("rows");
+const meta = document.getElementById("meta");
+const errEl = document.getElementById("err");
+const empty = document.getElementById("empty");
+
+function dur(s) {
+  s = Math.max(0, s|0);
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
+        m = Math.floor(s%3600/60);
+  if (d) return d+"d "+h+"h";
+  if (h) return h+"h "+m+"m";
+  if (m) return m+"m";
+  return s+"s";
+}
+
+async function kill(pid, force) {
+  const verb = force ? "FORCE KILL (SIGKILL)" : "kill (SIGTERM)";
+  if (!confirm(verb + " PID " + pid + "?")) return;
+  try {
+    const r = await fetch(`/api/kill/${pid}?force=${force}`, {method: "POST"});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.status);
+    await refresh();
+  } catch (e) { errEl.textContent = "kill failed: " + e.message; }
+}
+
+async function refresh() {
+  let data;
+  try {
+    const r = await fetch("/api/agents");
+    data = await r.json();
+    errEl.textContent = "";
+  } catch (e) { errEl.textContent = "fetch failed: " + e.message; return; }
+
+  const a = data.agents;
+  meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus · ${a.length} agents · ${new Date(data.ts*1000).toLocaleTimeString()}`;
+  empty.hidden = a.length > 0;
+  rows.innerHTML = a.map(x => {
+    const cpuPct = Math.min(100, x.cpu_percent);
+    const protectedNote = x.protected ? ' title="protected — cannot be killed"' : "";
+    return `<tr>
+      <td><span class="label">${x.label}</span></td>
+      <td>${x.pid}</td>
+      <td><span class="dot ${x.alive?'live':'dead'}"></span>${x.status}</td>
+      <td class="num">${x.cpu_percent.toFixed(1)}
+        <div class="bar"><i style="width:${cpuPct}%"></i></div></td>
+      <td class="num">${x.mem_mb.toFixed(0)}</td>
+      <td class="num">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
+      <td class="num">${dur(x.uptime_s)}</td>
+      <td class="cmd" title="${x.cmdline.replace(/"/g,'&quot;')}">${x.cmdline}</td>
+      <td>
+        <button class="kill" ${x.protected?'disabled':''}${protectedNote}
+          onclick="kill(${x.pid}, false)">kill</button>
+        <button class="kill" ${x.protected?'disabled':''}
+          onclick="kill(${x.pid}, true)">force</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

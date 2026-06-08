@@ -1,0 +1,28 @@
+# Which processes count as "agents". A process is shown if its name OR full
+# command line matches any pattern below (case-insensitive substring or regex).
+# Only processes that match here can be listed AND killed — the kill endpoint
+# re-checks the match before sending a signal, so the dashboard can never be
+# used to kill an arbitrary unrelated PID.
+agents:
+  - label: openclaw
+    match: openclaw
+  - label: hermes
+    match: hermes
+  - label: claude-code
+    match: "claude(\\s|$|-code)"
+    regex: true
+  - label: ollama
+    match: ollama
+  - label: vllm
+    match: vllm
+  - label: llama.cpp
+    match: llama-server
+
+# Patterns that must NEVER be killed even if they match an agent pattern above.
+# Self (this monitor's own PID) and PID 1 are always protected in code.
+protect:
+  - agent-usage-manager
+  - uvicorn
+
+# GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).
+# On Apple Silicon there is no per-process GPU API, so the GPU column is blank.
