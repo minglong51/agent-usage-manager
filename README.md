@@ -9,23 +9,29 @@ No database, no auth layer, no dependencies beyond FastAPI + psutil. Runs on
 macOS and Linux. Meant to be cloned, configured, and run on any node in a fleet.
 
 ```
-AGENT        PID    STATUS     CPU %   MEM MB   GPU MB   UPTIME   COMMAND            ┆
-openclaw     48213  ● running    62.4    1840     7320     2h 11m  openclaw serve …   [kill] [force]
-hermes       49001  ● running    18.0     512        —     44m     hermes worker …    [kill] [force]
-ollama       50122  ● running     3.1    9210    14080     6h 02m  ollama runner …    [kill] [force]
-vllm         50890  ● running     0.0     220        —     12m     python -m vllm …   [kill] [force]
+AGENT          PID    STATUS     CPU %   MEM MB   GPU MB   UPTIME   COMMAND          ┆
+openclaw +3    48213  ● running    62.4    1840     7320     2h 11m  openclaw serve … [kill] [force]
+claude-code +9 73590  ● running    97.4    7630        —     1h 02m  claude --chann … [kill] [force]
+hermes         49001  ● running    18.0     512        —     44m     hermes worker …  [kill] [force]
+ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama runner …  [kill] [force]
 ```
+(`+N` = child processes rolled up under the agent; CPU/mem/GPU are tree totals.)
 
 > A live web UI (auto-refreshing every 3s). The rendered GIF lands here once recorded —
 > see `demo.tape`.
 
 ## What it does
 
+- **One row per agent.** Agents are grouped by process tree — the spawned children
+  of an agent (inference subprocesses, MCP servers, helpers) are rolled up under it
+  with a `+N` badge instead of cluttering the list as separate rows.
 - **Liveness** — green dot = running, red = zombie/dead. Status column shows the OS state.
-- **Usage** — CPU % (since last poll), resident memory (MB), GPU memory (MB, NVIDIA only),
-  and uptime, refreshed every 3s.
-- **Kill** — `kill` sends SIGTERM (graceful), `force` sends SIGKILL. SIGTERM auto-escalates
-  to SIGKILL if the process doesn't exit in 3s.
+- **Usage** — CPU %, resident memory (MB), GPU memory (MB, NVIDIA only), and uptime,
+  refreshed every 3s. **CPU/mem/GPU are tree totals** — the agent's true cost including
+  everything it spawned.
+- **Kill the tree** — `kill` sends SIGTERM to the agent *and its children* (so spawned
+  helpers don't leak resources), `force` sends SIGKILL. SIGTERM auto-escalates to
+  SIGKILL after 3s. The confirm dialog tells you how many child processes will stop.
 
 ## Safety
 

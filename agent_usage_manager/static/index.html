@@ -25,6 +25,7 @@
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .label { background: #1f6feb33; color: #79c0ff; padding: 1px 7px;
            border-radius: 10px; font-size: 12px; }
+  .kids { color: #8b949e; font-size: 11px; margin-left: 5px; cursor: help; }
   .bar { height: 5px; background: #21262d; border-radius: 3px; margin-top: 3px; }
   .bar > i { display: block; height: 100%; border-radius: 3px; background: #d29922; }
   button.kill { background: #da3633; color: #fff; border: 0; padding: 5px 12px;
@@ -70,9 +71,12 @@ function dur(s) {
   return s+"s";
 }
 
-async function kill(pid, force) {
+async function kill(pid, force, children) {
   const verb = force ? "FORCE KILL (SIGKILL)" : "kill (SIGTERM)";
-  if (!confirm(verb + " PID " + pid + "?")) return;
+  const kids = children > 0
+    ? ` and its ${children} child process${children > 1 ? "es" : ""}`
+    : "";
+  if (!confirm(verb + " PID " + pid + kids + "?")) return;
   try {
     const r = await fetch(`/api/kill/${pid}?force=${force}`, {method: "POST"});
     const j = await r.json();
@@ -95,8 +99,11 @@ async function refresh() {
   rows.innerHTML = a.map(x => {
     const cpuPct = Math.min(100, x.cpu_percent);
     const protectedNote = x.protected ? ' title="protected — cannot be killed"' : "";
+    const kids = x.child_count > 0
+      ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU shown are tree totals; kill stops the whole tree">+${x.child_count}</span>`
+      : "";
     return `<tr>
-      <td><span class="label">${x.label}</span></td>
+      <td><span class="label">${x.label}</span>${kids}</td>
       <td>${x.pid}</td>
       <td><span class="dot ${x.alive?'live':'dead'}"></span>${x.status}</td>
       <td class="num">${x.cpu_percent.toFixed(1)}
@@ -107,9 +114,9 @@ async function refresh() {
       <td class="cmd" title="${x.cmdline.replace(/"/g,'&quot;')}">${x.cmdline}</td>
       <td>
         <button class="kill" ${x.protected?'disabled':''}${protectedNote}
-          onclick="kill(${x.pid}, false)">kill</button>
+          onclick="kill(${x.pid}, false, ${x.child_count})">kill</button>
         <button class="kill" ${x.protected?'disabled':''}
-          onclick="kill(${x.pid}, true)">force</button>
+          onclick="kill(${x.pid}, true, ${x.child_count})">force</button>
       </td>
     </tr>`;
   }).join("");

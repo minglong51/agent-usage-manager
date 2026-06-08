@@ -1,8 +1,14 @@
-# Which processes count as "agents". A process is shown if its name OR full
-# command line matches any pattern below (case-insensitive substring or regex).
+# Which processes count as "agents". A process matches if the pattern hits its
+# executable name + first few arguments (case-insensitive substring or regex) —
+# NOT the entire command line, so a process that merely mentions an agent name
+# deep in its args (e.g. inside a system prompt) is not misclassified.
 # Only processes that match here can be listed AND killed — the kill endpoint
 # re-checks the match before sending a signal, so the dashboard can never be
 # used to kill an arbitrary unrelated PID.
+#
+# Matched processes are grouped by process tree: one row per agent (the root),
+# with child processes rolled up. CPU/mem/GPU are tree totals, and "kill" stops
+# the whole tree (root + children) so spawned helpers don't leak resources.
 agents:
   - label: openclaw
     match: openclaw

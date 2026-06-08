@@ -167,62 +167,137 @@ class Agent(BaseModel):
     mem_mb: float
     gpu_mem_mb: Optional[float]
     uptime_s: float
+    child_count: int
     protected: bool
+
+
+def _collect() -> tuple[dict, dict, dict, dict]:
+    """One pass over all processes.
+
+    Returns (meta, children, label_of, procmap):
+      meta[pid]     = {ppid, name, status, ct}
+      children[ppid]= [pid, ...]
+      label_of[pid] = matcher label (only present for matched processes)
+      procmap[pid]  = the psutil.Process from this poll
+    """
+    meta: dict[int, dict] = {}
+    children: dict[int, list[int]] = {}
+    label_of: dict[int, str] = {}
+    procmap: dict[int, psutil.Process] = {}
+    for proc in psutil.process_iter(["pid", "ppid", "name", "status", "create_time"]):
+        pid = proc.info["pid"]
+        ppid = proc.info.get("ppid") or 0
+        name = proc.info.get("name") or ""
+        meta[pid] = {
+            "ppid": ppid,
+            "name": name,
+            "status": proc.info.get("status") or "?",
+            "ct": proc.info.get("create_time"),
+        }
+        children.setdefault(ppid, []).append(pid)
+        procmap[pid] = proc
+        label = _label_for(_match_target(proc)) or _label_for(name)
+        if label:
+            label_of[pid] = label
+    return meta, children, label_of, procmap
+
+
+def _ancestors(pid: int, meta: dict):
+    seen: set[int] = set()
+    cur = meta.get(pid, {}).get("ppid", 0)
+    while cur and cur not in seen:
+        seen.add(cur)
+        yield cur
+        cur = meta.get(cur, {}).get("ppid", 0)
+
+
+def _descendants(root: int, children: dict) -> list[int]:
+    out: list[int] = []
+    stack = list(children.get(root, []))
+    seen: set[int] = set()
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        stack.extend(children.get(p, []))
+    return out
+
+
+def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
+    handle = _handles.get(pid)
+    if handle is None or handle.pid != pid:
+        handle = procmap.get(pid)
+        if handle is None:
+            try:
+                handle = psutil.Process(pid)
+            except psutil.NoSuchProcess:
+                return 0.0, 0.0
+        _handles[pid] = handle
+        try:
+            handle.cpu_percent(None)
+        except psutil.Error:
+            pass
+    try:
+        return handle.cpu_percent(None), handle.memory_info().rss / (1024 * 1024)
+    except psutil.Error:
+        return 0.0, 0.0
 
 
 @app.get("/api/agents")
 def list_agents() -> dict:
     gpu = _gpu_by_pid()
-    seen: set[int] = set()
-    agents: list[Agent] = []
     now = time.time()
+    meta, children, label_of, procmap = _collect()
+    matched = set(label_of)
 
-    for proc in psutil.process_iter(["pid", "name", "status", "create_time"]):
-        pid = proc.info["pid"]
-        target = _match_target(proc)
-        label = _label_for(target) or _label_for(proc.info.get("name") or "")
-        if not label:
-            continue
-        cmd = _cmdline(proc)
-        seen.add(pid)
-        handle = _handles.get(pid)
-        if handle is None or handle.pid != pid:
-            handle = proc
-            _handles[pid] = handle
-            try:
-                handle.cpu_percent(None)
-            except psutil.Error:
-                pass
-        try:
-            cpu = handle.cpu_percent(None)
-            mem = handle.memory_info().rss / (1024 * 1024)
-            status = handle.status()
-            alive = handle.is_running() and status != psutil.STATUS_ZOMBIE
-        except (psutil.NoSuchProcess, psutil.ZombieProcess):
-            cpu, mem, status, alive = 0.0, 0.0, "dead", False
-        except psutil.AccessDenied:
-            cpu, mem = 0.0, 0.0
-            status, alive = proc.info.get("status", "?"), True
+    # An agent's "root" is a matched process with no matched ancestor; any matched
+    # descendant is rolled up into it rather than shown as its own row.
+    roots = [
+        pid
+        for pid in matched
+        if not any(a in matched for a in _ancestors(pid, meta))
+    ]
 
-        ct = proc.info.get("create_time") or now
+    agents: list[Agent] = []
+    for root in roots:
+        subtree = [root] + _descendants(root, children)
+        cpu = mem = gpu_sum = 0.0
+        has_gpu = False
+        for p in subtree:
+            c, m = _cpu_mem(p, procmap)
+            cpu += c
+            mem += m
+            if p in gpu:
+                gpu_sum += gpu[p]
+                has_gpu = True
+        info = meta[root]
+        rproc = procmap.get(root)
+        cmd = _cmdline(rproc) if rproc else info["name"]
+        ct = info["ct"] or now
         agents.append(
             Agent(
-                pid=pid,
-                label=label,
-                name=proc.info.get("name") or "",
+                pid=root,
+                label=label_of[root],
+                name=info["name"],
                 cmdline=cmd[:300],
-                status=status,
-                alive=alive,
+                status=info["status"],
+                alive=info["status"] != psutil.STATUS_ZOMBIE,
                 cpu_percent=round(cpu, 1),
                 mem_mb=round(mem, 1),
-                gpu_mem_mb=gpu.get(pid),
+                gpu_mem_mb=round(gpu_sum, 1) if has_gpu else None,
                 uptime_s=round(now - ct, 0),
-                protected=_is_protected(target, pid),
+                child_count=len(subtree) - 1,
+                protected=_is_protected(
+                    _match_target(rproc) if rproc else info["name"], root
+                ),
             )
         )
 
+    live = set(meta)
     for pid in list(_handles):
-        if pid not in seen:
+        if pid not in live:
             _handles.pop(pid, None)
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)
@@ -232,6 +307,30 @@ def list_agents() -> dict:
         "cpu_count": psutil.cpu_count(),
         "ts": now,
     }
+
+
+def _signal_tree(root_pid: int, sig: signal.Signals) -> list[psutil.Process]:
+    """Send `sig` to the root and every descendant, skipping self/PID 1/protected."""
+    _, children, _, procmap = _collect()
+    victims = [root_pid] + _descendants(root_pid, children)
+    signaled: list[psutil.Process] = []
+    for p in victims:
+        if p in (SELF_PID, 1):
+            continue
+        proc = procmap.get(p)
+        if proc is None:
+            try:
+                proc = psutil.Process(p)
+            except psutil.NoSuchProcess:
+                continue
+        try:
+            if _is_protected(_match_target(proc), p):
+                continue
+            proc.send_signal(sig)
+            signaled.append(proc)
+        except psutil.Error:
+            pass
+    return signaled
 
 
 @app.post("/api/kill/{pid}")
@@ -248,25 +347,24 @@ def kill_agent(pid: int, force: bool = False) -> dict:
         raise HTTPException(403, f"PID {pid} is protected — refusing")
 
     sig = signal.SIGKILL if force else signal.SIGTERM
-    try:
-        proc.send_signal(sig)
-    except psutil.NoSuchProcess:
-        return {"pid": pid, "result": "already gone"}
-    except psutil.AccessDenied:
-        raise HTTPException(403, f"Access denied sending signal to PID {pid}")
-
-    try:
-        proc.wait(timeout=3)
-        return {"pid": pid, "result": "terminated", "signal": sig.name}
-    except psutil.TimeoutExpired:
-        if not force:
+    signaled = _signal_tree(pid, sig)
+    gone, alive = psutil.wait_procs(signaled, timeout=3)
+    if alive and not force:
+        for p in alive:
             try:
-                proc.send_signal(signal.SIGKILL)
-                proc.wait(timeout=3)
-                return {"pid": pid, "result": "killed", "signal": "SIGKILL"}
+                p.send_signal(signal.SIGKILL)
             except psutil.Error:
                 pass
-        return {"pid": pid, "result": "signal sent, still running", "signal": sig.name}
+        more_gone, alive = psutil.wait_procs(alive, timeout=3)
+        gone += more_gone
+
+    return {
+        "pid": pid,
+        "result": "terminated" if not alive else "signal sent, some still running",
+        "signal": sig.name,
+        "killed": len(gone),
+        "still_running": len(alive),
+    }
 
 
 @app.get("/")
