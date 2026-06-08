@@ -40,6 +40,8 @@
   button.kill:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
   .empty { padding: 40px 20px; color: #8b949e; }
   .err { color: #f85149; }
+  .ok { color: #3fb950; }
+  body.hide-gpu .gpu { display: none; }   /* no GPU data (e.g. Apple Silicon) → drop the dead column */
 </style>
 </head>
 <body>
@@ -53,7 +55,7 @@
     <tr>
       <th>agent</th><th>pid</th><th>status</th>
       <th class="num">cpu %</th><th class="num">mem MB</th>
-      <th class="num">gpu MB</th><th class="num">uptime</th>
+      <th class="num gpu">gpu MB</th><th class="num">uptime</th>
       <th>command</th><th></th>
     </tr>
   </thead>
@@ -95,8 +97,11 @@ async function kill(pid, force, children) {
     const r = await fetch(`/api/kill/${pid}?force=${force}`, {method: "POST"});
     const j = await r.json();
     if (!r.ok) throw new Error(j.detail || r.status);
+    errEl.className = "meta ok";
+    errEl.textContent = `✓ ${j.result} (${j.killed} process${j.killed===1?"":"es"})`;
+    setTimeout(() => { errEl.textContent = ""; errEl.className = "meta"; }, 4000);
     await refresh();
-  } catch (e) { errEl.textContent = "kill failed: " + e.message; }
+  } catch (e) { errEl.className = "meta err"; errEl.textContent = "kill failed: " + e.message; }
 }
 
 function copyHint(el) {
@@ -108,6 +113,9 @@ function copyHint(el) {
 }
 
 async function refresh() {
+  // Don't re-render mid-selection — it would yank a command/launchctl hint the
+  // user is in the middle of copying.
+  if (String(window.getSelection?.() || "").length) return;
   let data;
   try {
     const r = await fetch("/api/agents");
@@ -124,8 +132,14 @@ async function refresh() {
     : "";
   meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus · ${a.length} agents${load} · ${new Date(data.ts*1000).toLocaleTimeString()}`;
   empty.hidden = a.length > 0;
+  // Drop the GPU column entirely when nothing reports GPU (Apple Silicon has no
+  // per-process GPU API) — an always-"—" column reads as broken, not empty.
+  document.body.classList.toggle("hide-gpu", !a.some(x => x.gpu_mem_mb != null));
+  const cpus = data.cpu_count || 1;
   rows.innerHTML = a.map(x => {
-    const cpuPct = Math.min(100, x.cpu_percent);
+    // Bar = share of the whole machine (cpu_percent is per-core, so a tree can
+    // exceed 100%); the number column still shows the raw per-core total.
+    const cpuPct = Math.min(100, x.cpu_percent / cpus);
     const protectedNote = x.protected ? ' title="protected — cannot be killed"' : "";
     const kids = x.child_count > 0
       ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU shown are tree totals; kill stops the whole tree">+${x.child_count}</span>`
@@ -145,10 +159,10 @@ async function refresh() {
       <td><span class="label">${esc(x.label)}</span>${svc}${kids}</td>
       <td>${x.pid}</td>
       <td><span class="dot ${x.alive?'live':'dead'}"></span>${esc(x.status)}</td>
-      <td class="num">${x.cpu_percent.toFixed(1)}
+      <td class="num" title="${x.cpu_percent.toFixed(0)}% of one core · bar = share of all ${cpus} cores">${x.cpu_percent.toFixed(1)}
         <div class="bar"><i style="width:${cpuPct}%"></i></div></td>
       <td class="num">${x.mem_mb.toFixed(0)}</td>
-      <td class="num">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
+      <td class="num gpu">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
       <td class="num">${dur(x.uptime_s)}</td>
       <td class="cmd" title="${esc(x.cmdline)}">${esc(x.cmdline)}</td>
       <td>${actions}</td>
