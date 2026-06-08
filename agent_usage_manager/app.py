@@ -17,7 +17,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE = Path(__file__).parent
-CONFIG_PATH = Path(os.environ.get("AGENTS_CONFIG", BASE / "agents.yaml"))
+
+
+def _resolve_config() -> Path:
+    env = os.environ.get("AGENTS_CONFIG")
+    if env:
+        return Path(env)
+    cwd_cfg = Path.cwd() / "agents.yaml"
+    if cwd_cfg.exists():
+        return cwd_cfg
+    return BASE / "agents.yaml"
+
+
+CONFIG_PATH = _resolve_config()
 
 
 class Matcher:

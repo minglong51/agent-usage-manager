@@ -4,10 +4,8 @@ cd "$(dirname "$0")"
 
 if [ ! -d .venv ]; then
   python3 -m venv .venv
-  ./.venv/bin/pip install -q -r requirements.txt
+  ./.venv/bin/pip install -q --upgrade pip
+  ./.venv/bin/pip install -q -e .
 fi
 
-HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8765}"
-echo "agent-usage-manager → http://${HOST}:${PORT}"
-exec ./.venv/bin/uvicorn app:app --host "$HOST" --port "$PORT"
+HOST="${HOST:-127.0.0.1}" PORT="${PORT:-8765}" ./.venv/bin/agent-usage-manager "$@"

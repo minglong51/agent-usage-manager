@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-usage-manager"
+version = "0.1.0"
+description = "htop for AI agents — liveness, CPU/mem/GPU usage, and a kill switch for headless agents (openclaw, hermes, ollama, vllm, claude-code)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["ai-agents", "monitoring", "gpu", "ollama", "vllm", "llm", "observability"]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "psutil>=5.9",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/CHANGEME/agent-usage-manager"
+Repository = "https://github.com/CHANGEME/agent-usage-manager"
+
+[project.scripts]
+agent-usage-manager = "agent_usage_manager.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_usage_manager"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"agent_usage_manager/static" = "agent_usage_manager/static"
+"agent_usage_manager/agents.yaml" = "agent_usage_manager/agents.yaml"

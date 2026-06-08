@@ -34,18 +34,28 @@ This is the important part — a web page that can kill processes needs guardrai
 
 ## Quick start
 
+Run it without installing anything (needs [`uv`](https://github.com/astral-sh/uv)):
+
 ```bash
-git clone <this-repo> && cd agent-usage-manager
-./run.sh                       # creates .venv, installs deps, serves on :8765
+uvx agent-usage-manager
 # open http://127.0.0.1:8765
 ```
 
-Or manually:
+Or install it:
 
 ```bash
-python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
-./.venv/bin/uvicorn app:app --port 8765
+pipx install agent-usage-manager   # or: pip install agent-usage-manager
+agent-usage-manager --port 8765
 ```
+
+From a clone (for hacking on it):
+
+```bash
+git clone <this-repo> && cd agent-usage-manager
+./run.sh                           # venv + editable install, serves on :8765
+```
+
+Flags: `--host`, `--port`, `--config /path/to/agents.yaml`.
 
 ## Configure which processes are "agents"
 
