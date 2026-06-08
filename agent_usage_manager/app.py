@@ -60,14 +60,33 @@ MATCHERS, PROTECT = load_config()
 SELF_PID = os.getpid()
 
 
+_SECRET_KV = re.compile(
+    r"(?i)([\w.-]*(?:token|key|secret|password|passwd|api[_-]?key|auth)[\w.-]*\s*[=:]\s*)\S+"
+)
+_SECRET_FLAG = re.compile(
+    r"(?i)(--?(?:token|key|secret|password|api[_-]?key|auth)\S*\s+)\S+"
+)
+_SECRET_VALUE = re.compile(
+    r"\b(sk-[A-Za-z0-9]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|xox[bap]-[A-Za-z0-9-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,})"
+)
+
+
+def _redact(text: str) -> str:
+    text = _SECRET_KV.sub(r"\1***", text)
+    text = _SECRET_FLAG.sub(r"\1***", text)
+    text = _SECRET_VALUE.sub("***", text)
+    return text
+
+
 def _cmdline(proc: psutil.Process) -> str:
     try:
-        return " ".join(proc.cmdline()) or proc.name()
+        raw = " ".join(proc.cmdline()) or proc.name()
     except (psutil.AccessDenied, psutil.ZombieProcess, psutil.NoSuchProcess):
         try:
-            return proc.name()
+            raw = proc.name()
         except psutil.Error:
             return ""
+    return _redact(raw)
 
 
 def _label_for(text: str) -> Optional[str]:

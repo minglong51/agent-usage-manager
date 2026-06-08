@@ -8,7 +8,16 @@ gives you a **kill button** per agent.
 No database, no auth layer, no dependencies beyond FastAPI + psutil. Runs on
 macOS and Linux. Meant to be cloned, configured, and run on any node in a fleet.
 
-![one row per agent: label · pid · liveness · cpu% · mem · gpu · uptime · kill](docs/screenshot.png)
+```
+AGENT        PID    STATUS     CPU %   MEM MB   GPU MB   UPTIME   COMMAND            ┆
+openclaw     48213  ● running    62.4    1840     7320     2h 11m  openclaw serve …   [kill] [force]
+hermes       49001  ● running    18.0     512        —     44m     hermes worker …    [kill] [force]
+ollama       50122  ● running     3.1    9210    14080     6h 02m  ollama runner …    [kill] [force]
+vllm         50890  ● running     0.0     220        —     12m     python -m vllm …   [kill] [force]
+```
+
+> A live web UI (auto-refreshing every 3s). The rendered GIF lands here once recorded —
+> see `demo.tape`.
 
 ## What it does
 
@@ -28,6 +37,9 @@ This is the important part — a web page that can kill processes needs guardrai
 - **Protected patterns.** Anything matching `protect:` in `agents.yaml` — plus the
   monitor's own process and PID 1 — shows a disabled, greyed-out kill button and is
   refused server-side.
+- **Secret redaction.** Command lines often carry tokens/keys in env vars or flags
+  (`FOO_TOKEN=...`, `--api-key ...`, `sk-...`, `ghp_...`, JWTs). The command column
+  redacts these to `***` before they ever reach the browser — safe to screenshot.
 - **Bind local by default.** It listens on `127.0.0.1`. Don't expose it to a network
   without putting auth in front of it (reverse proxy + basic auth, SSH tunnel, etc.) —
   it has no built-in authentication.
