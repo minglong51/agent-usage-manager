@@ -38,6 +38,17 @@
                 border-radius: 6px; cursor: pointer; font: inherit; }
   button.kill:hover { background: #f85149; }
   button.kill:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
+  /* force = SIGKILL, the more destructive action — render it secondary (ghost)
+     so it isn't a same-weight one-click neighbour of plain kill. */
+  button.kill.ghost { background: transparent; color: #8b949e; border: 1px solid #30363d;
+                      padding: 4px 9px; font-size: 12px; }
+  button.kill.ghost:hover { background: #da363322; color: #f85149; border-color: #da3633; }
+  button.kill.ghost:disabled { background: transparent; color: #484f58; border-color: #21262d; }
+  /* stale = last /api/agents fetch failed; dim the data we can no longer trust. */
+  #stale { display: none; background: #3d1d00; color: #d29922; font-size: 12px;
+           padding: 6px 20px; border-bottom: 1px solid #5a2d00; }
+  body.stale #stale { display: block; }
+  body.stale table { opacity: .45; transition: opacity .2s; }
   .empty { padding: 40px 20px; color: #8b949e; }
   .err { color: #f85149; }
   .ok { color: #3fb950; }
@@ -50,6 +61,7 @@
   <span class="meta" id="meta">loading…</span>
   <span class="meta" id="err"></span>
 </header>
+<div id="stale"></div>
 <table>
   <thead>
     <tr>
@@ -68,6 +80,8 @@ const rows = document.getElementById("rows");
 const meta = document.getElementById("meta");
 const errEl = document.getElementById("err");
 const empty = document.getElementById("empty");
+const stale = document.getElementById("stale");
+let lastOk = null;   // timestamp of the last successful /api/agents fetch
 
 // Escape before injecting into innerHTML — cmdlines and launchd labels are
 // host data, and this page has a kill endpoint, so HTML/script injection is a
@@ -119,9 +133,22 @@ async function refresh() {
   let data;
   try {
     const r = await fetch("/api/agents");
+    if (!r.ok) throw new Error("HTTP " + r.status);
     data = await r.json();
-    errEl.textContent = "";
-  } catch (e) { errEl.textContent = "fetch failed: " + e.message; return; }
+    // recovered → clear the stale state and any prior fetch error
+    document.body.classList.remove("stale");
+    if (errEl.textContent.startsWith("fetch failed")) errEl.textContent = "";
+  } catch (e) {
+    // Don't blank the table — keep showing the last good data, but mark it
+    // untrusted so nobody kills based on a frozen view.
+    document.body.classList.add("stale");
+    const last = lastOk ? " · last update " + lastOk.toLocaleTimeString() : "";
+    stale.textContent = "⚠ disconnected from the agent monitor — data below may be stale" + last;
+    errEl.className = "meta err";
+    errEl.textContent = "fetch failed: " + e.message;
+    return;
+  }
+  lastOk = new Date();
 
   const a = data.agents;
   // CPU/mem totals across agents — at-a-glance load, not just a count.
@@ -153,7 +180,8 @@ async function refresh() {
       ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${esc(x.stop_hint)}</code>`
       : `<button class="kill" ${x.protected?'disabled':''}${protectedNote}
           onclick="kill(${x.pid}, false, ${x.child_count})">kill</button>
-        <button class="kill" ${x.protected?'disabled':''}
+        <button class="kill ghost" ${x.protected?'disabled':''}
+          title="SIGKILL — forceful, no cleanup. Use only if plain kill won't stop it."
           onclick="kill(${x.pid}, true, ${x.child_count})">force</button>`;
     return `<tr>
       <td><span class="label">${esc(x.label)}</span>${svc}${kids}</td>
