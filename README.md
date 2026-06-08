@@ -109,6 +109,25 @@ a generically-named binary (Kiro.app → `Electron`) are still matched by app na
 drops it from agent classification entirely. Point at a different file with
 `AGENTS_CONFIG=/path/to/agents.yaml`.
 
+## launchd-supervised agents (macOS)
+
+Some agents run as **launchd services** (a `~/Library/LaunchAgents/*.plist`, or
+anything started by `brew services`). If such a job sets `KeepAlive`, a signal
+can't stop it: the process dies, launchd immediately respawns it under a new PID,
+and the dashboard's "kill" looks like it silently failed.
+
+The dashboard detects these (via `launchctl list`) and marks them with a
+**`launchd`** badge. Instead of dead-end kill/force buttons it shows the command
+that actually stops the job — click to copy:
+
+```sh
+launchctl bootout gui/<uid>/<label>            # stop now
+launchctl disable gui/<uid>/<label>            # …and don't auto-start at login
+```
+
+The kill endpoint refuses signals for these jobs (HTTP 409) and returns the same
+guidance, so the API never lies about a kill that won't stick.
+
 ## GPU notes
 
 Per-process GPU memory comes from `nvidia-smi` when it's on `PATH` (Linux / NVIDIA).

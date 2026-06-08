@@ -191,6 +191,44 @@ def _is_protected(text: str, pid: int) -> bool:
     return any(p in low for p in PROTECT)
 
 
+def _launchd_jobs() -> dict[int, str]:
+    """Map pid -> launchd label for currently-running launchd jobs (macOS).
+
+    Parsed from `launchctl list`, whose rows are `PID<tab>Status<tab>Label`. A
+    process that appears here with a real PID is supervised by launchd: stopping
+    it with a signal won't persist if the job sets KeepAlive — launchd just
+    respawns it under a new PID, which reads as "the kill didn't work". The
+    correct way to stop such a job is `launchctl bootout`, not a signal.
+
+    Empty on non-macOS or when launchctl is unavailable.
+    """
+    if not shutil.which("launchctl"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    jobs: dict[int, str] = {}
+    for line in out.splitlines()[1:]:  # skip the PID/Status/Label header
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            pid_s = parts[0].strip()
+            # Not-running jobs show "-" in the PID column; skip those.
+            if pid_s.isdigit() and int(pid_s) > 0:
+                jobs[int(pid_s)] = parts[2].strip()
+    return jobs
+
+
+def _stop_hint(label: str) -> str:
+    """The appropriate `launchctl` command to actually stop a supervised job."""
+    return f"launchctl bootout gui/{os.getuid()}/{label}"
+
+
 def _gpu_by_pid() -> dict[int, float]:
     """Best-effort per-process GPU memory (MiB) via nvidia-smi. Empty on macOS."""
     if not shutil.which("nvidia-smi"):
@@ -238,6 +276,10 @@ class Agent(BaseModel):
     uptime_s: float
     child_count: int
     protected: bool
+    # When set, this agent is supervised by launchd (value = its launchd label).
+    # A signal won't stop it for good; `stop_hint` is the launchctl command that will.
+    supervised: Optional[str] = None
+    stop_hint: Optional[str] = None
 
 
 def _collect() -> tuple[dict, dict, dict, dict]:
@@ -321,6 +363,7 @@ def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
 @app.get("/api/agents")
 def list_agents() -> dict:
     gpu = _gpu_by_pid()
+    jobs = _launchd_jobs()
     now = time.time()
     meta, children, label_of, procmap = _collect()
     matched = set(label_of)
@@ -365,6 +408,8 @@ def list_agents() -> dict:
                 protected=_is_protected(
                     _match_target(rproc) if rproc else info["name"], root
                 ),
+                supervised=jobs.get(root),
+                stop_hint=_stop_hint(jobs[root]) if root in jobs else None,
             )
         )
 
@@ -424,6 +469,22 @@ def kill_agent(pid: int, force: bool = False) -> dict:
         raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
     if _is_protected(target, pid):
         raise HTTPException(403, f"PID {pid} is protected — refusing")
+
+    # A launchd-supervised job won't die from a signal — if it sets KeepAlive,
+    # launchd respawns it instantly under a new PID and the kill looks like it
+    # silently failed. Don't pretend; hand back the launchctl command that
+    # actually stops it. force=True can't beat KeepAlive either, so it's no
+    # exception here.
+    label = _launchd_jobs().get(pid)
+    if label:
+        hint = _stop_hint(label)
+        raise HTTPException(
+            409,
+            f"PID {pid} is supervised by launchd (job '{label}') — a signal "
+            f"won't stick because launchd respawns it. Stop it with:  {hint}  "
+            f"(then `launchctl disable gui/{os.getuid()}/{label}` to keep it "
+            f"from auto-starting at login).",
+        )
 
     signaled = _signal_tree(pid, force)
     gone, alive = psutil.wait_procs(signaled, timeout=3)

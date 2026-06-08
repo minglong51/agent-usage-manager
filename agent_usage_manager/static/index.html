@@ -25,6 +25,12 @@
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .label { background: #1f6feb33; color: #79c0ff; padding: 1px 7px;
            border-radius: 10px; font-size: 12px; }
+  .svc { background: #bb800933; color: #d29922; padding: 1px 7px; margin-left: 5px;
+         border-radius: 10px; font-size: 11px; cursor: help; }
+  code.hint { font: 12px ui-monospace, Menlo, monospace; color: #adbac7;
+              background: #161b22; border: 1px solid #21262d; border-radius: 6px;
+              padding: 4px 8px; cursor: copy; white-space: nowrap; }
+  code.hint:hover { border-color: #d29922; }
   .kids { color: #8b949e; font-size: 11px; margin-left: 5px; cursor: help; }
   .bar { height: 5px; background: #21262d; border-radius: 3px; margin-top: 3px; }
   .bar > i { display: block; height: 100%; border-radius: 3px; background: #d29922; }
@@ -85,6 +91,14 @@ async function kill(pid, force, children) {
   } catch (e) { errEl.textContent = "kill failed: " + e.message; }
 }
 
+function copyHint(el) {
+  navigator.clipboard?.writeText(el.textContent).then(() => {
+    const prev = el.textContent;
+    el.textContent = "copied ✓";
+    setTimeout(() => { el.textContent = prev; }, 1000);
+  });
+}
+
 async function refresh() {
   let data;
   try {
@@ -102,8 +116,19 @@ async function refresh() {
     const kids = x.child_count > 0
       ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU shown are tree totals; kill stops the whole tree">+${x.child_count}</span>`
       : "";
+    const svc = x.supervised
+      ? ` <span class="svc" title="Supervised by launchd (job '${x.supervised}'). A signal won't stop it — launchd respawns it. Use the launchctl command on the right.">launchd</span>`
+      : "";
+    // launchd-supervised jobs can't be stopped by a signal; show the real
+    // command (click to copy) instead of dead-end kill buttons.
+    const actions = x.supervised
+      ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${x.stop_hint}</code>`
+      : `<button class="kill" ${x.protected?'disabled':''}${protectedNote}
+          onclick="kill(${x.pid}, false, ${x.child_count})">kill</button>
+        <button class="kill" ${x.protected?'disabled':''}
+          onclick="kill(${x.pid}, true, ${x.child_count})">force</button>`;
     return `<tr>
-      <td><span class="label">${x.label}</span>${kids}</td>
+      <td><span class="label">${x.label}</span>${svc}${kids}</td>
       <td>${x.pid}</td>
       <td><span class="dot ${x.alive?'live':'dead'}"></span>${x.status}</td>
       <td class="num">${x.cpu_percent.toFixed(1)}
@@ -112,12 +137,7 @@ async function refresh() {
       <td class="num">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
       <td class="num">${dur(x.uptime_s)}</td>
       <td class="cmd" title="${x.cmdline.replace(/"/g,'&quot;')}">${x.cmdline}</td>
-      <td>
-        <button class="kill" ${x.protected?'disabled':''}${protectedNote}
-          onclick="kill(${x.pid}, false, ${x.child_count})">kill</button>
-        <button class="kill" ${x.protected?'disabled':''}
-          onclick="kill(${x.pid}, true, ${x.child_count})">force</button>
-      </td>
+      <td>${actions}</td>
     </tr>`;
   }).join("");
 }
