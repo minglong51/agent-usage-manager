@@ -126,7 +126,12 @@ launchctl disable gui/<uid>/<label>            # …and don't auto-start at logi
 ```
 
 The kill endpoint refuses signals for these jobs (HTTP 409) and returns the same
-guidance, so the API never lies about a kill that won't stick.
+guidance, so the API never lies about a kill that won't stick. The message is
+tailored to the job: `KeepAlive` jobs are told a signal won't stick at all;
+`RunAtLoad`-only jobs are told a signal works now but the job restarts at next
+login. *Limitation:* detection runs in your user launchd domain, so root
+`LaunchDaemons` (which need a privileged `launchctl print system/…`) aren't
+flagged — a known gap, not silently handled.
 
 ## GPU notes
 

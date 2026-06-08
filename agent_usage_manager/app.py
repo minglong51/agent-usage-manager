@@ -191,6 +191,47 @@ def _is_protected(text: str, pid: int) -> bool:
     return any(p in low for p in PROTECT)
 
 
+_cache: dict[str, tuple[float, object]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cached(key: str, ttl: float, fn):
+    """Memoize fn() for `ttl` seconds. Collapses the per-request subprocess
+    calls (launchctl list, nvidia-smi) that back slowly-changing data, so a 3s
+    poll plus an immediate kill don't each re-shell-out."""
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+    val = fn()  # computed outside the lock so slow subprocesses don't serialize
+    with _cache_lock:
+        _cache[key] = (now, val)
+    return val
+
+
+def _keepalive(label: str) -> bool:
+    """True if the launchd job has a KeepAlive policy — i.e. launchd respawns it
+    on exit, so a signal genuinely won't stick. Read from `launchctl print`'s
+    `properties = …` line. Best-effort: any error returns False so the caller
+    uses milder 'restarts at login' wording and never over-claims.
+    """
+    try:
+        out = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    for line in out.splitlines():
+        s = line.strip().lower()
+        if s.startswith("properties =") and "keepalive" in s:
+            return True
+    return False
+
+
 def _launchd_jobs() -> dict[int, str]:
     """Map pid -> launchd label for currently-running launchd jobs (macOS).
 
@@ -199,6 +240,11 @@ def _launchd_jobs() -> dict[int, str]:
     it with a signal won't persist if the job sets KeepAlive — launchd just
     respawns it under a new PID, which reads as "the kill didn't work". The
     correct way to stop such a job is `launchctl bootout`, not a signal.
+
+    Scope limitation: this runs in the caller's (user) launchd domain, so it
+    only sees `gui/$UID` LaunchAgents — not root `LaunchDaemons`, which require
+    a privileged `launchctl print system/…`. A root daemon therefore won't be
+    flagged here; that's a known gap, documented rather than papered over.
 
     Empty on non-macOS or when launchctl is unavailable.
     """
@@ -362,8 +408,8 @@ def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
 
 @app.get("/api/agents")
 def list_agents() -> dict:
-    gpu = _gpu_by_pid()
-    jobs = _launchd_jobs()
+    gpu = _cached("gpu", 2.0, _gpu_by_pid)
+    jobs = _cached("launchd", 2.0, _launchd_jobs)
     now = time.time()
     meta, children, label_of, procmap = _collect()
     matched = set(label_of)
@@ -464,26 +510,36 @@ def kill_agent(pid: int, force: bool = False) -> dict:
     except psutil.NoSuchProcess:
         raise HTTPException(404, f"PID {pid} not found")
 
+    # Authorize exactly as listing does: a single _label_for(target) check.
+    # _match_target already falls back to the process name when the cmdline is
+    # unreadable, and _label_for returns None for ignored processes — so an
+    # `ignore:`d process is never killable (no proc.name() fallback to slip
+    # through, which previously bypassed the ignore list).
     target = _match_target(proc)
-    if _label_for(target) is None and _label_for(proc.name()) is None:
+    if _label_for(target) is None:
         raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
     if _is_protected(target, pid):
         raise HTTPException(403, f"PID {pid} is protected — refusing")
 
-    # A launchd-supervised job won't die from a signal — if it sets KeepAlive,
-    # launchd respawns it instantly under a new PID and the kill looks like it
-    # silently failed. Don't pretend; hand back the launchctl command that
-    # actually stops it. force=True can't beat KeepAlive either, so it's no
-    # exception here.
-    label = _launchd_jobs().get(pid)
+    # A launchd-supervised job is stopped via launchctl, not a signal — so route
+    # the caller there instead of silently failing. The wording is tailored to
+    # whether the job actually has KeepAlive (signal truly won't stick) vs. only
+    # RunAtLoad (signal works now but it restarts at next login) so we never
+    # over-claim. force=True can't beat KeepAlive either, so it's no exception.
+    label = _cached("launchd", 2.0, _launchd_jobs).get(pid)
     if label:
         hint = _stop_hint(label)
+        disable = f"launchctl disable gui/{os.getuid()}/{label}"
+        why = (
+            "a signal won't stick — launchd respawns it (KeepAlive)"
+            if _keepalive(label)
+            else "a signal stops it now but launchd restarts it at next login (RunAtLoad)"
+        )
         raise HTTPException(
             409,
-            f"PID {pid} is supervised by launchd (job '{label}') — a signal "
-            f"won't stick because launchd respawns it. Stop it with:  {hint}  "
-            f"(then `launchctl disable gui/{os.getuid()}/{label}` to keep it "
-            f"from auto-starting at login).",
+            f"PID {pid} is supervised by launchd (job '{label}') — {why}. "
+            f"Stop it with:  {hint}  (then `{disable}` to keep it from "
+            f"auto-starting).",
         )
 
     signaled = _signal_tree(pid, force)

@@ -67,6 +67,14 @@ const meta = document.getElementById("meta");
 const errEl = document.getElementById("err");
 const empty = document.getElementById("empty");
 
+// Escape before injecting into innerHTML — cmdlines and launchd labels are
+// host data, and this page has a kill endpoint, so HTML/script injection is a
+// real local-control risk.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function dur(s) {
   s = Math.max(0, s|0);
   const d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
@@ -108,7 +116,13 @@ async function refresh() {
   } catch (e) { errEl.textContent = "fetch failed: " + e.message; return; }
 
   const a = data.agents;
-  meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus · ${a.length} agents · ${new Date(data.ts*1000).toLocaleTimeString()}`;
+  // CPU/mem totals across agents — at-a-glance load, not just a count.
+  const totCpu = a.reduce((s, x) => s + x.cpu_percent, 0);
+  const totMem = a.reduce((s, x) => s + x.mem_mb, 0);
+  const load = a.length
+    ? ` · Σ ${totCpu.toFixed(0)}% cpu, ${(totMem/1024).toFixed(1)} GB`
+    : "";
+  meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus · ${a.length} agents${load} · ${new Date(data.ts*1000).toLocaleTimeString()}`;
   empty.hidden = a.length > 0;
   rows.innerHTML = a.map(x => {
     const cpuPct = Math.min(100, x.cpu_percent);
@@ -117,26 +131,26 @@ async function refresh() {
       ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU shown are tree totals; kill stops the whole tree">+${x.child_count}</span>`
       : "";
     const svc = x.supervised
-      ? ` <span class="svc" title="Supervised by launchd (job '${x.supervised}'). A signal won't stop it — launchd respawns it. Use the launchctl command on the right.">launchd</span>`
+      ? ` <span class="svc" title="Supervised by launchd (job '${esc(x.supervised)}'). A signal won't stop it — launchd respawns it. Use the launchctl command on the right.">launchd</span>`
       : "";
     // launchd-supervised jobs can't be stopped by a signal; show the real
     // command (click to copy) instead of dead-end kill buttons.
     const actions = x.supervised
-      ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${x.stop_hint}</code>`
+      ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${esc(x.stop_hint)}</code>`
       : `<button class="kill" ${x.protected?'disabled':''}${protectedNote}
           onclick="kill(${x.pid}, false, ${x.child_count})">kill</button>
         <button class="kill" ${x.protected?'disabled':''}
           onclick="kill(${x.pid}, true, ${x.child_count})">force</button>`;
     return `<tr>
-      <td><span class="label">${x.label}</span>${svc}${kids}</td>
+      <td><span class="label">${esc(x.label)}</span>${svc}${kids}</td>
       <td>${x.pid}</td>
-      <td><span class="dot ${x.alive?'live':'dead'}"></span>${x.status}</td>
+      <td><span class="dot ${x.alive?'live':'dead'}"></span>${esc(x.status)}</td>
       <td class="num">${x.cpu_percent.toFixed(1)}
         <div class="bar"><i style="width:${cpuPct}%"></i></div></td>
       <td class="num">${x.mem_mb.toFixed(0)}</td>
       <td class="num">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
       <td class="num">${dur(x.uptime_s)}</td>
-      <td class="cmd" title="${x.cmdline.replace(/"/g,'&quot;')}">${x.cmdline}</td>
+      <td class="cmd" title="${esc(x.cmdline)}">${esc(x.cmdline)}</td>
       <td>${actions}</td>
     </tr>`;
   }).join("");

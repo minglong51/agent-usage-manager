@@ -18,13 +18,17 @@ agents:
     match: "claude(\\s|$|-code)"
     regex: true
   - label: kiro
-    match: kiro
+    match: "\\bkiro\\b"        # word-anchored so it doesn't hit any kiro-named path
+    regex: true
   - label: aider
-    match: aider
+    match: "\\baider\\b"       # anchored: bare 'aider' matches 'raider', 'spider'…
+    regex: true
   - label: codex
-    match: codex
+    match: "\\bcodex\\b"
+    regex: true
   - label: cline
-    match: cline
+    match: "\\bcline\\b"       # anchored: bare 'cline' matches 'decline', 'incline'
+    regex: true
   - label: ollama
     match: ollama
   - label: vllm
