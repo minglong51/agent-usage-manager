@@ -127,6 +127,18 @@ WantedBy=default.target
 systemctl --user enable --now agent-usage-manager
 ```
 
+## Development
+
+```bash
+git clone https://github.com/minglong51/agent-usage-manager && cd agent-usage-manager
+pip install -e ".[dev]"
+pytest -q
+```
+
+CI runs the test suite on Linux + macOS (Python 3.9 and 3.12) on every push and PR.
+Cross-platform note: kill uses psutil's `terminate()`/`kill()`, which map to
+SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
+
 ## License
 
 MIT

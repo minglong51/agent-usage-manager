@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -46,13 +46,31 @@ class Matcher:
         return self.lower in text.lower()
 
 
-def load_config() -> tuple[list[Matcher], list[str]]:
-    data = yaml.safe_load(CONFIG_PATH.read_text())
-    matchers = [
-        Matcher(a["label"], a["match"], bool(a.get("regex", False)))
-        for a in data.get("agents", [])
-    ]
-    protect = [p.lower() for p in data.get("protect", [])]
+def load_config(path: Optional[Path] = None) -> tuple[list[Matcher], list[str]]:
+    path = path or CONFIG_PATH
+    try:
+        raw = path.read_text()
+    except OSError as e:
+        raise RuntimeError(f"Cannot read agents config {path}: {e}")
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as e:
+        raise RuntimeError(f"{path} is not valid YAML: {e}")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} must be a YAML mapping with an 'agents:' list")
+    matchers: list[Matcher] = []
+    for i, a in enumerate(data.get("agents") or []):
+        if not isinstance(a, dict) or "label" not in a or "match" not in a:
+            raise RuntimeError(
+                f"{path}: agents[{i}] needs both 'label' and 'match' (got {a!r})"
+            )
+        try:
+            matchers.append(Matcher(a["label"], a["match"], bool(a.get("regex", False))))
+        except re.error as e:
+            raise RuntimeError(
+                f"{path}: agents[{i}] ({a['label']}) has an invalid regex: {e}"
+            )
+    protect = [str(p).lower() for p in (data.get("protect") or [])]
     return matchers, protect
 
 
@@ -89,26 +107,32 @@ def _cmdline(proc: psutil.Process) -> str:
     return _redact(raw)
 
 
-def _match_target(proc: psutil.Process) -> str:
-    """Text used for agent matching: the executable basename + first few args.
+def _target_from_argv(argv: Optional[list], name: str) -> str:
+    """Matching text: executable basename + first few args.
 
     Deliberately NOT the full command line — a long embedded argument (e.g. a
     system prompt that happens to contain the word "claude") must not cause a
     parent/wrapper process to be misclassified as an agent.
     """
+    if argv:
+        head = [a for a in argv[:4] if a]
+        if head:
+            head[0] = os.path.basename(head[0])
+            return " ".join(head)
+    return name
+
+
+def _match_target(proc: psutil.Process) -> str:
+    """One-off match target for a single Process (used off the hot path)."""
     try:
         argv = proc.cmdline()
     except (psutil.AccessDenied, psutil.ZombieProcess, psutil.NoSuchProcess):
-        argv = []
-    if argv:
-        head = argv[:4]
-        if head[0]:
-            head[0] = os.path.basename(head[0])
-        return " ".join(head)
+        argv = None
     try:
-        return proc.name()
+        name = proc.name()
     except psutil.Error:
-        return ""
+        name = ""
+    return _target_from_argv(argv, name)
 
 
 def _label_for(text: str) -> Optional[str]:
@@ -153,7 +177,10 @@ def _gpu_by_pid() -> dict[int, float]:
 app = FastAPI(title="agent-usage-manager")
 
 # Persistent Process handles so cpu_percent() reports usage since the last poll.
+# Guarded by a lock because FastAPI runs sync endpoints in a threadpool, so
+# concurrent requests can touch this dict at once.
 _handles: dict[int, psutil.Process] = {}
+_handles_lock = threading.Lock()
 
 
 class Agent(BaseModel):
@@ -184,7 +211,8 @@ def _collect() -> tuple[dict, dict, dict, dict]:
     children: dict[int, list[int]] = {}
     label_of: dict[int, str] = {}
     procmap: dict[int, psutil.Process] = {}
-    for proc in psutil.process_iter(["pid", "ppid", "name", "status", "create_time"]):
+    attrs = ["pid", "ppid", "name", "status", "create_time", "cmdline"]
+    for proc in psutil.process_iter(attrs):
         pid = proc.info["pid"]
         ppid = proc.info.get("ppid") or 0
         name = proc.info.get("name") or ""
@@ -196,7 +224,9 @@ def _collect() -> tuple[dict, dict, dict, dict]:
         }
         children.setdefault(ppid, []).append(pid)
         procmap[pid] = proc
-        label = _label_for(_match_target(proc)) or _label_for(name)
+        # Use the cmdline psutil already batched into proc.info (one read per
+        # process) rather than a second cmdline() syscall per process.
+        label = _label_for(_target_from_argv(proc.info.get("cmdline"), name))
         if label:
             label_of[pid] = label
     return meta, children, label_of, procmap
@@ -226,19 +256,20 @@ def _descendants(root: int, children: dict) -> list[int]:
 
 
 def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
-    handle = _handles.get(pid)
-    if handle is None or handle.pid != pid:
-        handle = procmap.get(pid)
-        if handle is None:
+    with _handles_lock:
+        handle = _handles.get(pid)
+        if handle is None or handle.pid != pid:
+            handle = procmap.get(pid)
+            if handle is None:
+                try:
+                    handle = psutil.Process(pid)
+                except psutil.NoSuchProcess:
+                    return 0.0, 0.0
+            _handles[pid] = handle
             try:
-                handle = psutil.Process(pid)
-            except psutil.NoSuchProcess:
-                return 0.0, 0.0
-        _handles[pid] = handle
-        try:
-            handle.cpu_percent(None)
-        except psutil.Error:
-            pass
+                handle.cpu_percent(None)
+            except psutil.Error:
+                pass
     try:
         return handle.cpu_percent(None), handle.memory_info().rss / (1024 * 1024)
     except psutil.Error:
@@ -296,9 +327,10 @@ def list_agents() -> dict:
         )
 
     live = set(meta)
-    for pid in list(_handles):
-        if pid not in live:
-            _handles.pop(pid, None)
+    with _handles_lock:
+        for pid in list(_handles):
+            if pid not in live:
+                _handles.pop(pid, None)
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)
     return {
@@ -309,8 +341,13 @@ def list_agents() -> dict:
     }
 
 
-def _signal_tree(root_pid: int, sig: signal.Signals) -> list[psutil.Process]:
-    """Send `sig` to the root and every descendant, skipping self/PID 1/protected."""
+def _signal_tree(root_pid: int, force: bool) -> list[psutil.Process]:
+    """Stop the root and every descendant, skipping self/PID 1/protected.
+
+    Uses psutil's terminate()/kill(), which map to SIGTERM/SIGKILL on POSIX and
+    to TerminateProcess on Windows — so kill works cross-platform (raw
+    signal.SIGKILL does not exist on Windows).
+    """
     _, children, _, procmap = _collect()
     victims = [root_pid] + _descendants(root_pid, children)
     signaled: list[psutil.Process] = []
@@ -326,7 +363,7 @@ def _signal_tree(root_pid: int, sig: signal.Signals) -> list[psutil.Process]:
         try:
             if _is_protected(_match_target(proc), p):
                 continue
-            proc.send_signal(sig)
+            proc.kill() if force else proc.terminate()
             signaled.append(proc)
         except psutil.Error:
             pass
@@ -346,13 +383,12 @@ def kill_agent(pid: int, force: bool = False) -> dict:
     if _is_protected(target, pid):
         raise HTTPException(403, f"PID {pid} is protected — refusing")
 
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    signaled = _signal_tree(pid, sig)
+    signaled = _signal_tree(pid, force)
     gone, alive = psutil.wait_procs(signaled, timeout=3)
-    if alive and not force:
+    if alive and not force:  # graceful terminate didn't take — escalate to kill
         for p in alive:
             try:
-                p.send_signal(signal.SIGKILL)
+                p.kill()
             except psutil.Error:
                 pass
         more_gone, alive = psutil.wait_procs(alive, timeout=3)
@@ -361,7 +397,7 @@ def kill_agent(pid: int, force: bool = False) -> dict:
     return {
         "pid": pid,
         "result": "terminated" if not alive else "signal sent, some still running",
-        "signal": sig.name,
+        "method": "kill" if force else "terminate",
         "killed": len(gone),
         "still_running": len(alive),
     }
