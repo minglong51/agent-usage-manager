@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/CHANGEME/agent-usage-manager"
-Repository = "https://github.com/CHANGEME/agent-usage-manager"
+Homepage = "https://github.com/minglong51/agent-usage-manager"
+Repository = "https://github.com/minglong51/agent-usage-manager"
 
 [project.scripts]
 agent-usage-manager = "agent_usage_manager.cli:main"
