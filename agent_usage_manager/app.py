@@ -74,7 +74,28 @@ def load_config(path: Optional[Path] = None) -> tuple[list[Matcher], list[str]]:
     return matchers, protect
 
 
+def load_ignore(path: Optional[Path] = None) -> list[str]:
+    """Patterns that disqualify a process from being an agent entirely.
+
+    Unlike `protect:` (matched, listed, but kill-refused), an `ignore:` hit means
+    the process is never classified as an agent at all — it won't appear in the
+    dashboard and isn't killable. Used to drop incidental processes that share a
+    bundle/path with a real agent: crash handlers, auto-updaters, the editor's
+    own integrated-terminal shells, etc. Best-effort: the config has already been
+    validated by load_config() at import, so parse errors here just mean "none".
+    """
+    path = path or CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return [str(p).lower() for p in (data.get("ignore") or [])]
+
+
 MATCHERS, PROTECT = load_config()
+IGNORE = load_ignore()
 SELF_PID = os.getpid()
 
 
@@ -107,18 +128,32 @@ def _cmdline(proc: psutil.Process) -> str:
     return _redact(raw)
 
 
+_APP_BUNDLE = re.compile(r"/([^/]+)\.app/")
+
+
 def _target_from_argv(argv: Optional[list], name: str) -> str:
     """Matching text: executable basename + first few args.
 
     Deliberately NOT the full command line — a long embedded argument (e.g. a
     system prompt that happens to contain the word "claude") must not cause a
     parent/wrapper process to be misclassified as an agent.
+
+    On macOS the executable basename is often generic (Kiro.app and many other
+    Electron apps launch a binary literally named "Electron"), so the outermost
+    `.app` bundle name from argv[0] is prepended — that's the app's real
+    identity. Only the bundle name is added, never arbitrary path/arg text, so
+    the deep-arg protection above is preserved.
     """
     if argv:
         head = [a for a in argv[:4] if a]
         if head:
-            head[0] = os.path.basename(head[0])
-            return " ".join(head)
+            exe = head[0]
+            head[0] = os.path.basename(exe)
+            target = " ".join(head)
+            bundle = _APP_BUNDLE.search(exe)
+            if bundle:
+                target = f"{bundle.group(1)} {target}"
+            return target
     return name
 
 
@@ -135,7 +170,14 @@ def _match_target(proc: psutil.Process) -> str:
     return _target_from_argv(argv, name)
 
 
+def _ignored(text: str) -> bool:
+    low = text.lower()
+    return any(ig in low for ig in IGNORE)
+
+
 def _label_for(text: str) -> Optional[str]:
+    if _ignored(text):
+        return None
     for m in MATCHERS:
         if m.matches(text):
             return m.label

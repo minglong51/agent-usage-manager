@@ -90,12 +90,24 @@ agents:
     match: "claude(\\s|$|-code)"
     regex: true               # treat `match` as a regex instead of substring
 
-protect:                      # never killable, even if matched above
+protect:                      # matched + listed, but never killable
   - uvicorn
+
+ignore:                       # never an agent: not listed, not killable
+  - crashpad                  # incidental processes that share a name/bundle
+  - shipit                    # path with a real agent (crash handlers,
+  - kiro-cli-term             # auto-updaters, integrated-terminal shells, …)
 ```
 
-A process matches if the pattern hits its **full command line** or its process name.
-Point at a different file with `AGENTS_CONFIG=/path/to/agents.yaml`.
+A process matches if the pattern hits its **executable basename + first few
+arguments** — deliberately not the whole command line, so a long embedded arg
+(e.g. a system prompt mentioning "claude") can't misclassify a wrapper. On macOS
+the outermost `.app` **bundle name** is also included, so GUI agents that launch
+a generically-named binary (Kiro.app → `Electron`) are still matched by app name.
+
+`protect:` keeps a matched process listed but refuses to kill it; `ignore:`
+drops it from agent classification entirely. Point at a different file with
+`AGENTS_CONFIG=/path/to/agents.yaml`.
 
 ## GPU notes
 
