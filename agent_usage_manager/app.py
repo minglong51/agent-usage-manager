@@ -89,6 +89,28 @@ def _cmdline(proc: psutil.Process) -> str:
     return _redact(raw)
 
 
+def _match_target(proc: psutil.Process) -> str:
+    """Text used for agent matching: the executable basename + first few args.
+
+    Deliberately NOT the full command line — a long embedded argument (e.g. a
+    system prompt that happens to contain the word "claude") must not cause a
+    parent/wrapper process to be misclassified as an agent.
+    """
+    try:
+        argv = proc.cmdline()
+    except (psutil.AccessDenied, psutil.ZombieProcess, psutil.NoSuchProcess):
+        argv = []
+    if argv:
+        head = argv[:4]
+        if head[0]:
+            head[0] = os.path.basename(head[0])
+        return " ".join(head)
+    try:
+        return proc.name()
+    except psutil.Error:
+        return ""
+
+
 def _label_for(text: str) -> Optional[str]:
     for m in MATCHERS:
         if m.matches(text):
@@ -157,10 +179,11 @@ def list_agents() -> dict:
 
     for proc in psutil.process_iter(["pid", "name", "status", "create_time"]):
         pid = proc.info["pid"]
-        cmd = _cmdline(proc)
-        label = _label_for(cmd) or _label_for(proc.info.get("name") or "")
+        target = _match_target(proc)
+        label = _label_for(target) or _label_for(proc.info.get("name") or "")
         if not label:
             continue
+        cmd = _cmdline(proc)
         seen.add(pid)
         handle = _handles.get(pid)
         if handle is None or handle.pid != pid:
@@ -194,7 +217,7 @@ def list_agents() -> dict:
                 mem_mb=round(mem, 1),
                 gpu_mem_mb=gpu.get(pid),
                 uptime_s=round(now - ct, 0),
-                protected=_is_protected(cmd, pid),
+                protected=_is_protected(target, pid),
             )
         )
 
@@ -218,10 +241,10 @@ def kill_agent(pid: int, force: bool = False) -> dict:
     except psutil.NoSuchProcess:
         raise HTTPException(404, f"PID {pid} not found")
 
-    cmd = _cmdline(proc)
-    if _label_for(cmd) is None and _label_for(proc.name()) is None:
+    target = _match_target(proc)
+    if _label_for(target) is None and _label_for(proc.name()) is None:
         raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
-    if _is_protected(cmd, pid):
+    if _is_protected(target, pid):
         raise HTTPException(403, f"PID {pid} is protected — refusing")
 
     sig = signal.SIGKILL if force else signal.SIGTERM
