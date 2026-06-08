@@ -18,13 +18,17 @@ agents:
     match: "claude(\\s|$|-code)"
     regex: true
   - label: kiro
-    match: kiro
+    match: "\\bkiro\\b"        # word-anchored so it doesn't hit any kiro-named path
+    regex: true
   - label: aider
-    match: aider
+    match: "\\baider\\b"       # anchored: bare 'aider' matches 'raider', 'spider'…
+    regex: true
   - label: codex
-    match: codex
+    match: "\\bcodex\\b"
+    regex: true
   - label: cline
-    match: cline
+    match: "\\bcline\\b"       # anchored: bare 'cline' matches 'decline', 'incline'
+    regex: true
   - label: ollama
     match: ollama
   - label: vllm
@@ -37,6 +41,22 @@ agents:
 protect:
   - agent-usage-manager
   - uvicorn
+
+# Patterns that disqualify a process from being an agent at all — not listed,
+# not killable. Use this for incidental processes that share a name or bundle
+# path with a real agent. Checked against the same match target (executable
+# basename + first args + macOS .app bundle name), case-insensitive substring.
+#
+# Why these: a GUI agent like Kiro.app launches its main process as "Electron",
+# so agents are matched by the .app bundle name ("Kiro"). That also sweeps in the
+# app's crash handler, its Squirrel auto-updater (ShipIt), and the editor's
+# integrated-terminal shells (titled "kiro-cli-term") — none of which are the
+# agent. Ignoring them leaves one clean row for the app (helpers roll up under
+# it) instead of a cluster of un-killable, self-respawning fragments.
+ignore:
+  - crashpad      # chrome_crashpad_handler — the bundle's crash reporter
+  - shipit        # Squirrel.framework auto-updater
+  - kiro-cli-term # Kiro's integrated-terminal shells (zsh), not the agent
 
 # GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).
 # On Apple Silicon there is no per-process GPU API, so the GPU column is blank.

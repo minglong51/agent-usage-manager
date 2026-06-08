@@ -90,12 +90,48 @@ agents:
     match: "claude(\\s|$|-code)"
     regex: true               # treat `match` as a regex instead of substring
 
-protect:                      # never killable, even if matched above
+protect:                      # matched + listed, but never killable
   - uvicorn
+
+ignore:                       # never an agent: not listed, not killable
+  - crashpad                  # incidental processes that share a name/bundle
+  - shipit                    # path with a real agent (crash handlers,
+  - kiro-cli-term             # auto-updaters, integrated-terminal shells, …)
 ```
 
-A process matches if the pattern hits its **full command line** or its process name.
-Point at a different file with `AGENTS_CONFIG=/path/to/agents.yaml`.
+A process matches if the pattern hits its **executable basename + first few
+arguments** — deliberately not the whole command line, so a long embedded arg
+(e.g. a system prompt mentioning "claude") can't misclassify a wrapper. On macOS
+the outermost `.app` **bundle name** is also included, so GUI agents that launch
+a generically-named binary (Kiro.app → `Electron`) are still matched by app name.
+
+`protect:` keeps a matched process listed but refuses to kill it; `ignore:`
+drops it from agent classification entirely. Point at a different file with
+`AGENTS_CONFIG=/path/to/agents.yaml`.
+
+## launchd-supervised agents (macOS)
+
+Some agents run as **launchd services** (a `~/Library/LaunchAgents/*.plist`, or
+anything started by `brew services`). If such a job sets `KeepAlive`, a signal
+can't stop it: the process dies, launchd immediately respawns it under a new PID,
+and the dashboard's "kill" looks like it silently failed.
+
+The dashboard detects these (via `launchctl list`) and marks them with a
+**`launchd`** badge. Instead of dead-end kill/force buttons it shows the command
+that actually stops the job — click to copy:
+
+```sh
+launchctl bootout gui/<uid>/<label>            # stop now
+launchctl disable gui/<uid>/<label>            # …and don't auto-start at login
+```
+
+The kill endpoint refuses signals for these jobs (HTTP 409) and returns the same
+guidance, so the API never lies about a kill that won't stick. The message is
+tailored to the job: `KeepAlive` jobs are told a signal won't stick at all;
+`RunAtLoad`-only jobs are told a signal works now but the job restarts at next
+login. *Limitation:* detection runs in your user launchd domain, so root
+`LaunchDaemons` (which need a privileged `launchctl print system/…`) aren't
+flagged — a known gap, not silently handled.
 
 ## GPU notes
 

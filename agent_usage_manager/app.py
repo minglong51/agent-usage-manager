@@ -74,7 +74,28 @@ def load_config(path: Optional[Path] = None) -> tuple[list[Matcher], list[str]]:
     return matchers, protect
 
 
+def load_ignore(path: Optional[Path] = None) -> list[str]:
+    """Patterns that disqualify a process from being an agent entirely.
+
+    Unlike `protect:` (matched, listed, but kill-refused), an `ignore:` hit means
+    the process is never classified as an agent at all — it won't appear in the
+    dashboard and isn't killable. Used to drop incidental processes that share a
+    bundle/path with a real agent: crash handlers, auto-updaters, the editor's
+    own integrated-terminal shells, etc. Best-effort: the config has already been
+    validated by load_config() at import, so parse errors here just mean "none".
+    """
+    path = path or CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return [str(p).lower() for p in (data.get("ignore") or [])]
+
+
 MATCHERS, PROTECT = load_config()
+IGNORE = load_ignore()
 SELF_PID = os.getpid()
 
 
@@ -107,18 +128,32 @@ def _cmdline(proc: psutil.Process) -> str:
     return _redact(raw)
 
 
+_APP_BUNDLE = re.compile(r"/([^/]+)\.app/")
+
+
 def _target_from_argv(argv: Optional[list], name: str) -> str:
     """Matching text: executable basename + first few args.
 
     Deliberately NOT the full command line — a long embedded argument (e.g. a
     system prompt that happens to contain the word "claude") must not cause a
     parent/wrapper process to be misclassified as an agent.
+
+    On macOS the executable basename is often generic (Kiro.app and many other
+    Electron apps launch a binary literally named "Electron"), so the outermost
+    `.app` bundle name from argv[0] is prepended — that's the app's real
+    identity. Only the bundle name is added, never arbitrary path/arg text, so
+    the deep-arg protection above is preserved.
     """
     if argv:
         head = [a for a in argv[:4] if a]
         if head:
-            head[0] = os.path.basename(head[0])
-            return " ".join(head)
+            exe = head[0]
+            head[0] = os.path.basename(exe)
+            target = " ".join(head)
+            bundle = _APP_BUNDLE.search(exe)
+            if bundle:
+                target = f"{bundle.group(1)} {target}"
+            return target
     return name
 
 
@@ -135,7 +170,14 @@ def _match_target(proc: psutil.Process) -> str:
     return _target_from_argv(argv, name)
 
 
+def _ignored(text: str) -> bool:
+    low = text.lower()
+    return any(ig in low for ig in IGNORE)
+
+
 def _label_for(text: str) -> Optional[str]:
+    if _ignored(text):
+        return None
     for m in MATCHERS:
         if m.matches(text):
             return m.label
@@ -147,6 +189,90 @@ def _is_protected(text: str, pid: int) -> bool:
         return True
     low = text.lower()
     return any(p in low for p in PROTECT)
+
+
+_cache: dict[str, tuple[float, object]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cached(key: str, ttl: float, fn):
+    """Memoize fn() for `ttl` seconds. Collapses the per-request subprocess
+    calls (launchctl list, nvidia-smi) that back slowly-changing data, so a 3s
+    poll plus an immediate kill don't each re-shell-out."""
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+    val = fn()  # computed outside the lock so slow subprocesses don't serialize
+    with _cache_lock:
+        _cache[key] = (now, val)
+    return val
+
+
+def _keepalive(label: str) -> bool:
+    """True if the launchd job has a KeepAlive policy — i.e. launchd respawns it
+    on exit, so a signal genuinely won't stick. Read from `launchctl print`'s
+    `properties = …` line. Best-effort: any error returns False so the caller
+    uses milder 'restarts at login' wording and never over-claims.
+    """
+    try:
+        out = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    for line in out.splitlines():
+        s = line.strip().lower()
+        if s.startswith("properties =") and "keepalive" in s:
+            return True
+    return False
+
+
+def _launchd_jobs() -> dict[int, str]:
+    """Map pid -> launchd label for currently-running launchd jobs (macOS).
+
+    Parsed from `launchctl list`, whose rows are `PID<tab>Status<tab>Label`. A
+    process that appears here with a real PID is supervised by launchd: stopping
+    it with a signal won't persist if the job sets KeepAlive — launchd just
+    respawns it under a new PID, which reads as "the kill didn't work". The
+    correct way to stop such a job is `launchctl bootout`, not a signal.
+
+    Scope limitation: this runs in the caller's (user) launchd domain, so it
+    only sees `gui/$UID` LaunchAgents — not root `LaunchDaemons`, which require
+    a privileged `launchctl print system/…`. A root daemon therefore won't be
+    flagged here; that's a known gap, documented rather than papered over.
+
+    Empty on non-macOS or when launchctl is unavailable.
+    """
+    if not shutil.which("launchctl"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    jobs: dict[int, str] = {}
+    for line in out.splitlines()[1:]:  # skip the PID/Status/Label header
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            pid_s = parts[0].strip()
+            # Not-running jobs show "-" in the PID column; skip those.
+            if pid_s.isdigit() and int(pid_s) > 0:
+                jobs[int(pid_s)] = parts[2].strip()
+    return jobs
+
+
+def _stop_hint(label: str) -> str:
+    """The appropriate `launchctl` command to actually stop a supervised job."""
+    return f"launchctl bootout gui/{os.getuid()}/{label}"
 
 
 def _gpu_by_pid() -> dict[int, float]:
@@ -196,6 +322,10 @@ class Agent(BaseModel):
     uptime_s: float
     child_count: int
     protected: bool
+    # When set, this agent is supervised by launchd (value = its launchd label).
+    # A signal won't stop it for good; `stop_hint` is the launchctl command that will.
+    supervised: Optional[str] = None
+    stop_hint: Optional[str] = None
 
 
 def _collect() -> tuple[dict, dict, dict, dict]:
@@ -278,7 +408,8 @@ def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
 
 @app.get("/api/agents")
 def list_agents() -> dict:
-    gpu = _gpu_by_pid()
+    gpu = _cached("gpu", 2.0, _gpu_by_pid)
+    jobs = _cached("launchd", 2.0, _launchd_jobs)
     now = time.time()
     meta, children, label_of, procmap = _collect()
     matched = set(label_of)
@@ -323,6 +454,8 @@ def list_agents() -> dict:
                 protected=_is_protected(
                     _match_target(rproc) if rproc else info["name"], root
                 ),
+                supervised=jobs.get(root),
+                stop_hint=_stop_hint(jobs[root]) if root in jobs else None,
             )
         )
 
@@ -377,11 +510,37 @@ def kill_agent(pid: int, force: bool = False) -> dict:
     except psutil.NoSuchProcess:
         raise HTTPException(404, f"PID {pid} not found")
 
+    # Authorize exactly as listing does: a single _label_for(target) check.
+    # _match_target already falls back to the process name when the cmdline is
+    # unreadable, and _label_for returns None for ignored processes — so an
+    # `ignore:`d process is never killable (no proc.name() fallback to slip
+    # through, which previously bypassed the ignore list).
     target = _match_target(proc)
-    if _label_for(target) is None and _label_for(proc.name()) is None:
+    if _label_for(target) is None:
         raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
     if _is_protected(target, pid):
         raise HTTPException(403, f"PID {pid} is protected — refusing")
+
+    # A launchd-supervised job is stopped via launchctl, not a signal — so route
+    # the caller there instead of silently failing. The wording is tailored to
+    # whether the job actually has KeepAlive (signal truly won't stick) vs. only
+    # RunAtLoad (signal works now but it restarts at next login) so we never
+    # over-claim. force=True can't beat KeepAlive either, so it's no exception.
+    label = _cached("launchd", 2.0, _launchd_jobs).get(pid)
+    if label:
+        hint = _stop_hint(label)
+        disable = f"launchctl disable gui/{os.getuid()}/{label}"
+        why = (
+            "a signal won't stick — launchd respawns it (KeepAlive)"
+            if _keepalive(label)
+            else "a signal stops it now but launchd restarts it at next login (RunAtLoad)"
+        )
+        raise HTTPException(
+            409,
+            f"PID {pid} is supervised by launchd (job '{label}') — {why}. "
+            f"Stop it with:  {hint}  (then `{disable}` to keep it from "
+            f"auto-starting).",
+        )
 
     signaled = _signal_tree(pid, force)
     gone, alive = psutil.wait_procs(signaled, timeout=3)
