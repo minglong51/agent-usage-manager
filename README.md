@@ -73,7 +73,8 @@ git clone <this-repo> && cd agent-usage-manager
 ./run.sh                           # venv + editable install, serves on :8765
 ```
 
-Flags: `--host`, `--port`, `--config /path/to/agents.yaml`.
+It opens the dashboard in your browser automatically. Flags: `--host`, `--port`,
+`--config /path/to/agents.yaml`, `--no-browser` (for headless/server use).
 
 ## Configure which processes are "agents"
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-usage-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "htop for AI agents — liveness, CPU/mem/GPU usage, and a kill switch for headless agents (openclaw, hermes, ollama, vllm, claude-code)."
 readme = "README.md"
 license = { text = "MIT" }
