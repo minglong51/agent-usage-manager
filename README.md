@@ -52,19 +52,34 @@ This is the important part — a web page that can kill processes needs guardrai
 
 ## Quick start
 
-Run it without installing anything (needs [`uv`](https://github.com/astral-sh/uv)):
+**Recommended — one command, nothing to install first:**
 
 ```bash
 uvx agent-usage-manager
-# open http://127.0.0.1:8765
+# then open http://127.0.0.1:8765 (it also opens automatically)
 ```
 
-Or install it:
+`uvx` fetches and runs it in one step — no separate install, no virtualenv, no
+leftovers. Don't have [`uv`](https://github.com/astral-sh/uv) yet? One line:
 
 ```bash
-pipx install agent-usage-manager   # or: pip install agent-usage-manager
-agent-usage-manager --port 8765
+curl -LsSf https://astral.sh/uv/install.sh | sh      # macOS / Linux
+# or: pip install uv
 ```
+
+<details>
+<summary>Other ways to install</summary>
+
+```bash
+pipx install agent-usage-manager     # clean isolated global CLI (needs pipx)
+
+pip install agent-usage-manager      # universal; use inside a venv —
+                                     # system Python may refuse with
+                                     # "externally-managed-environment"
+```
+
+Then run `agent-usage-manager` (flags below).
+</details>
 
 From a clone (for hacking on it):
 
