@@ -17,6 +17,14 @@ agents:
   - label: claude-code
     match: "claude(\\s|$|-code)"
     regex: true
+  - label: kiro
+    match: kiro
+  - label: aider
+    match: aider
+  - label: codex
+    match: codex
+  - label: cline
+    match: cline
   - label: ollama
     match: ollama
   - label: vllm
