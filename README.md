@@ -8,6 +8,12 @@ gives you a **kill button** per agent.
 No database, no auth layer, no dependencies beyond FastAPI + psutil. Runs on
 macOS and Linux. Meant to be cloned, configured, and run on any node in a fleet.
 
+![agent-usage-manager — live dashboard](docs/dashboard.png)
+
+*A real run: ten agents grouped by process tree (`+N` = children rolled up),
+per-agent CPU/memory/uptime, launchd-supervised jobs flagged, and a kill button
+per row.*
+
 ```
 AGENT          PID    STATUS     CPU %   MEM MB   GPU MB   UPTIME   COMMAND          ┆
 openclaw +3    48213  ● running    62.4    1840     7320     2h 11m  openclaw serve … [kill] [force]
@@ -17,8 +23,9 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
 ```
 (`+N` = child processes rolled up under the agent; CPU/mem/GPU are tree totals.)
 
-> A live web UI (auto-refreshing every 3s). The rendered GIF lands here once recorded —
-> see `demo.tape`.
+> The schematic above shows the GPU column (NVIDIA only); the screenshot is a real
+> run on Apple Silicon, where per-process GPU stats aren't available so that column
+> is hidden. The UI auto-refreshes every 3s.
 
 ## What it does
 
