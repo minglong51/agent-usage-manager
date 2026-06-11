@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import shutil
@@ -8,11 +9,12 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import psutil
 import yaml
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -302,6 +304,63 @@ def _gpu_by_pid() -> dict[int, float]:
 
 app = FastAPI(title="agent-usage-manager")
 
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _hostname_of(hostport: str) -> str:
+    try:
+        return (urlsplit(f"//{hostport}").hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _host_allowed(hostport: str) -> bool:
+    """True for loopback names and bare IP-literal hosts.
+
+    Rejecting non-local DNS names defeats DNS rebinding: a rebinding attack has
+    to arrive via the attacker's domain, so its Host header carries that domain
+    — never a bare IP. IP literals stay allowed so LAN access under
+    `--host 0.0.0.0` (the user's explicit opt-in) keeps working.
+    """
+    host = _hostname_of(hostport)
+    if host in _LOCAL_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def _browser_guard(request: Request, call_next):
+    # Binding to 127.0.0.1 does NOT keep browsers out: any web page the user
+    # visits can fire fetch() at this port. Two checks close that off without
+    # breaking curl or the dashboard itself:
+    #  1. Host must be local/IP-literal (DNS-rebinding guard, all requests).
+    #  2. A state-changing request carrying a foreign Origin is a cross-site
+    #     call — refuse it (CSRF guard for /api/kill). Same-origin posts from
+    #     the dashboard carry a matching Origin; CLI tools send none at all.
+    #     `Origin: null` (sandboxed iframe, file://) is foreign by this rule.
+    if not _host_allowed(request.headers.get("host", "")):
+        return JSONResponse(
+            {"detail": "Host header is not a local address — refusing (DNS-rebinding guard)"},
+            status_code=403,
+        )
+    origin = request.headers.get("origin")
+    if origin and request.method not in ("GET", "HEAD", "OPTIONS"):
+        try:
+            o_host = (urlsplit(origin).hostname or "").lower()
+        except ValueError:
+            o_host = ""
+        if o_host != _hostname_of(request.headers.get("host", "")) and o_host not in _LOCAL_HOSTS:
+            return JSONResponse(
+                {"detail": "Cross-origin request refused (CSRF guard)"},
+                status_code=403,
+            )
+    return await call_next(request)
+
 # Persistent Process handles so cpu_percent() reports usage since the last poll.
 # Guarded by a lock because FastAPI runs sync endpoints in a threadpool, so
 # concurrent requests can touch this dict at once.
@@ -474,14 +533,27 @@ def list_agents() -> dict:
     }
 
 
-def _signal_tree(root_pid: int, force: bool) -> list[psutil.Process]:
+def _signal_tree(root: psutil.Process, force: bool) -> list[psutil.Process]:
     """Stop the root and every descendant, skipping self/PID 1/protected.
+
+    `root` is the handle that passed authorization in kill_agent — its cached
+    create_time pins the process identity. The fresh _collect() below re-finds
+    the pid; if the original process exited in between and the OS reused its
+    pid, the create_times differ and nothing is signaled. Without this check a
+    just-spawned unrelated process could be killed under the dead agent's pid.
 
     Uses psutil's terminate()/kill(), which map to SIGTERM/SIGKILL on POSIX and
     to TerminateProcess on Windows — so kill works cross-platform (raw
     signal.SIGKILL does not exist on Windows).
     """
+    root_pid = root.pid
     _, children, _, procmap = _collect()
+    current = procmap.get(root_pid)
+    try:
+        if current is None or current.create_time() != root.create_time():
+            return []
+    except psutil.Error:
+        return []
     victims = [root_pid] + _descendants(root_pid, children)
     signaled: list[psutil.Process] = []
     for p in victims:
@@ -507,6 +579,7 @@ def _signal_tree(root_pid: int, force: bool) -> list[psutil.Process]:
 def kill_agent(pid: int, force: bool = False) -> dict:
     try:
         proc = psutil.Process(pid)
+        proc.create_time()  # cache identity now — _signal_tree compares against it
     except psutil.NoSuchProcess:
         raise HTTPException(404, f"PID {pid} not found")
 
@@ -542,7 +615,17 @@ def kill_agent(pid: int, force: bool = False) -> dict:
             f"auto-starting).",
         )
 
-    signaled = _signal_tree(pid, force)
+    signaled = _signal_tree(proc, force)
+    if not signaled and not proc.is_running():
+        # Exited between authorization and signaling (is_running() is pid-reuse
+        # aware) — report that rather than a fake "terminated".
+        return {
+            "pid": pid,
+            "result": "already exited",
+            "method": "kill" if force else "terminate",
+            "killed": 0,
+            "still_running": 0,
+        }
     gone, alive = psutil.wait_procs(signaled, timeout=3)
     if alive and not force:  # graceful terminate didn't take — escalate to kill
         for p in alive:

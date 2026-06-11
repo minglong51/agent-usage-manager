@@ -53,6 +53,12 @@ This is the important part — a web page that can kill processes needs guardrai
 - **Secret redaction.** Command lines often carry tokens/keys in env vars or flags
   (`FOO_TOKEN=...`, `--api-key ...`, `sk-...`, `ghp_...`, JWTs). The command column
   redacts these to `***` before they ever reach the browser — safe to screenshot.
+- **Browser guard (CSRF + DNS rebinding).** Binding to localhost doesn't keep
+  browsers out — any web page you visit can `fetch()` a localhost port. Requests
+  whose `Host` is a non-local DNS name are refused (DNS-rebinding guard), and a
+  kill request carrying a foreign `Origin` is refused (CSRF guard) — so a
+  malicious page can't kill your agents or read your process list. `curl` and
+  the dashboard itself are unaffected.
 - **Bind local by default.** It listens on `127.0.0.1`. Don't expose it to a network
   without putting auth in front of it (reverse proxy + basic auth, SSH tunnel, etc.) —
   it has no built-in authentication.

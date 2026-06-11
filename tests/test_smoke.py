@@ -65,7 +65,9 @@ def test_load_config_bad_regex(tmp_path):
 
 @pytest.fixture
 def client():
-    return TestClient(m.app)
+    # base_url matters: the browser guard rejects non-local Host headers, and
+    # TestClient's default base_url ("http://testserver") is a DNS name.
+    return TestClient(m.app, base_url="http://127.0.0.1")
 
 
 def test_api_agents_ok(client):
@@ -90,3 +92,36 @@ def test_kill_self_refused(client):
 
 def test_kill_unknown_pid_404(client):
     assert client.post("/api/kill/2147480000").status_code == 404
+
+
+def test_host_guard_blocks_dns_rebinding(client):
+    # A rebinding attack arrives with the attacker's domain in Host.
+    r = client.get("/api/agents", headers={"host": "evil.example.com:8765"})
+    assert r.status_code == 403
+
+
+def test_host_guard_allows_ip_literal(client):
+    # LAN access under --host 0.0.0.0 presents a bare IP — must keep working.
+    r = client.get("/api/agents", headers={"host": "192.168.1.50:8765"})
+    assert r.status_code == 200
+
+
+def test_csrf_guard_blocks_cross_origin_kill(client):
+    r = client.post("/api/kill/2147480000", headers={"origin": "https://evil.example.com"})
+    assert r.status_code == 403
+
+
+def test_csrf_guard_blocks_null_origin_kill(client):
+    # Origin: null = sandboxed iframe / file:// — foreign, not trusted.
+    r = client.post("/api/kill/2147480000", headers={"origin": "null"})
+    assert r.status_code == 403
+
+
+def test_csrf_guard_allows_same_origin_kill(client):
+    # The dashboard's own fetch() sends a matching Origin; must pass the guard
+    # (and then 404 on the unknown pid, proving it reached the endpoint).
+    r = client.post(
+        "/api/kill/2147480000",
+        headers={"origin": "http://127.0.0.1", "host": "127.0.0.1"},
+    )
+    assert r.status_code == 404
