@@ -39,6 +39,20 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
 - **Kill the tree** — `kill` sends SIGTERM to the agent *and its children* (so spawned
   helpers don't leak resources), `force` sends SIGKILL. SIGTERM auto-escalates to
   SIGKILL after 3s. The confirm dialog tells you how many child processes will stop.
+- **Trends, not just snapshots.** Each row has a CPU sparkline (last ~20 min, sampled
+  in the background even with no browser open), plus a **`hot 5m+`** badge when an
+  agent has been pegged ≥90% CPU for 5+ minutes and an **`idle 10m+`** badge when a
+  long-running agent has done nothing for 10+ minutes — the two states worth
+  investigating (runaway vs. possibly wedged).
+- **Expand the tree.** Click the `+N` badge to unfold an agent's child processes
+  (per-child CPU/mem/command) — see what a kill would actually stop before clicking it.
+- **Config hot-reload.** Edits to `agents.yaml` apply on the next poll, no restart.
+  A broken edit keeps the last good config and shows the parse error in the header.
+- **`list` subcommand.** `agent-usage-manager list` (or `list --json`) prints a one-shot
+  table to stdout — no server, good for scripts and cron checks.
+- **Kill-safe table.** Rows keep a stable order (sorted by label) and never reorder
+  while your pointer is over the table, so the kill button can't shift under your
+  cursor mid-click.
 
 ## Safety
 
@@ -169,7 +183,10 @@ on Macs — CPU and memory are the meaningful resource signals there.
 
 ## API
 
-- `GET  /api/agents` → `{ agents: [...], host, cpu_count, ts }`
+- `GET  /api/agents` → `{ agents: [...], host, cpu_count, mem_total_mb, mem_used_pct, config_path, config_error, ts }`
+  — each agent includes `trend` (recent CPU samples) and `flag` (`"hot"` / `"idle"` / `null`)
+- `GET  /api/tree/{pid}` → the agent's process subtree (per-child pid/name/cpu/mem/cmdline);
+  only works on recognized agents, same authorization as kill
 - `POST /api/kill/{pid}?force=false` → SIGTERM (or SIGKILL with `force=true`)
 
 ## Run as a service

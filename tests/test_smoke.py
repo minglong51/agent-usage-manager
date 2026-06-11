@@ -117,6 +117,75 @@ def test_csrf_guard_blocks_null_origin_kill(client):
     assert r.status_code == 403
 
 
+def test_api_agents_has_system_fields(client):
+    body = client.get("/api/agents").json()
+    assert body["config_path"]
+    assert body["mem_total_mb"] > 0
+    for a in body["agents"]:
+        assert "trend" in a and "flag" in a
+
+
+def test_tree_refuses_non_agent(client):
+    assert client.get("/api/tree/1").status_code == 403
+
+
+def test_tree_unknown_pid_404(client):
+    assert client.get("/api/tree/2147480000").status_code == 404
+
+
+def test_config_hot_reload(client, tmp_path, monkeypatch):
+    import agent_usage_manager.app as m
+
+    cfg = tmp_path / "agents.yaml"
+    cfg.write_text("agents:\n  - label: reloaded\n    match: zz-reload-probe\n")
+    monkeypatch.setattr(m, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(m, "_config_mtime", None)
+    orig = (m.MATCHERS, m.PROTECT, m.IGNORE)
+    try:
+        m._maybe_reload_config()
+        assert [x.label for x in m.MATCHERS] == ["reloaded"]
+        assert m.CONFIG_ERROR is None
+
+        # a broken edit keeps the last good config and surfaces the error
+        cfg.write_text("agents: [broken")
+        monkeypatch.setattr(m, "_config_mtime", None)  # force mtime mismatch
+        m._maybe_reload_config()
+        assert [x.label for x in m.MATCHERS] == ["reloaded"]
+        assert "not valid YAML" in m.CONFIG_ERROR
+    finally:
+        m.MATCHERS, m.PROTECT, m.IGNORE = orig
+        m.CONFIG_ERROR = None
+
+
+def test_flags_need_sustained_window():
+    import time
+
+    import agent_usage_manager.app as m
+
+    now = time.time()
+    key = (99999, 123.0)
+    try:
+        m._history[key] = m.deque(
+            [(now - 360 + i * 3, 95.0, 100.0) for i in range(120)], maxlen=400
+        )
+        assert m._trend_and_flag(key, 700)[1] == "hot"
+        m._history[key] = m.deque(
+            [(now - 660 + i * 3, 0.5, 100.0) for i in range(220)], maxlen=400
+        )
+        assert m._trend_and_flag(key, 700)[1] == "idle"
+        # young series and short uptime must not flag
+        m._history[key] = m.deque(
+            [(now - 60 + i * 3, 95.0, 100.0) for i in range(20)], maxlen=400
+        )
+        assert m._trend_and_flag(key, 700)[1] is None
+        m._history[key] = m.deque(
+            [(now - 660 + i * 3, 0.5, 100.0) for i in range(220)], maxlen=400
+        )
+        assert m._trend_and_flag(key, 300)[1] is None
+    finally:
+        m._history.pop(key, None)
+
+
 def test_csrf_guard_allows_same_origin_kill(client):
     # The dashboard's own fetch() sends a matching Origin; must pass the guard
     # (and then 404 on the unknown pid, proving it reached the endpoint).

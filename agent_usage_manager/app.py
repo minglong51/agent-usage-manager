@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -99,6 +101,40 @@ def load_ignore(path: Optional[Path] = None) -> list[str]:
 MATCHERS, PROTECT = load_config()
 IGNORE = load_ignore()
 SELF_PID = os.getpid()
+
+CONFIG_ERROR: Optional[str] = None
+_config_lock = threading.Lock()
+try:
+    _config_mtime: Optional[float] = CONFIG_PATH.stat().st_mtime
+except OSError:
+    _config_mtime = None
+
+
+def _maybe_reload_config() -> None:
+    """Pick up agents.yaml edits without a server restart.
+
+    A parse error keeps the last good config (the dashboard must not lose its
+    allowlist mid-session) and is surfaced via CONFIG_ERROR so the UI can show
+    it. The bad mtime is recorded so the file isn't re-parsed on every poll —
+    only the next edit triggers another attempt.
+    """
+    global MATCHERS, PROTECT, IGNORE, CONFIG_ERROR, _config_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return
+    with _config_lock:
+        if mtime == _config_mtime:
+            return
+        _config_mtime = mtime
+        try:
+            matchers, protect = load_config()
+        except RuntimeError as e:
+            CONFIG_ERROR = str(e)
+            return
+        MATCHERS, PROTECT = matchers, protect
+        IGNORE = load_ignore()
+        CONFIG_ERROR = None
 
 
 _SECRET_KV = re.compile(
@@ -302,7 +338,20 @@ def _gpu_by_pid() -> dict[int, float]:
     return result
 
 
-app = FastAPI(title="agent-usage-manager")
+_sampler_started = threading.Event()
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    # The Event guards against double-start under test clients that enter the
+    # lifespan repeatedly; the thread itself (defined below) is a daemon.
+    if not _sampler_started.is_set():
+        _sampler_started.set()
+        threading.Thread(target=_sampler_loop, daemon=True, name="aum-sampler").start()
+    yield
+
+
+app = FastAPI(title="agent-usage-manager", lifespan=_lifespan)
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -367,6 +416,53 @@ async def _browser_guard(request: Request, call_next):
 _handles: dict[int, psutil.Process] = {}
 _handles_lock = threading.Lock()
 
+# Per-agent CPU/mem samples, keyed by (pid, create_time) so a recycled pid
+# starts a fresh series instead of inheriting the dead agent's history.
+_HISTORY_MAX = 400  # ~20 min at the 3s cadence
+_history: dict[tuple[int, float], deque] = {}
+_history_lock = threading.Lock()
+_last_collect = 0.0  # monotonic time of the last full list_agents() pass
+
+
+def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float], Optional[str]]:
+    """Recent CPU series for the row sparkline, plus a sustained-state flag.
+
+    hot  — mean CPU >= 90% of one core across a fully-covered 5-minute window:
+           the agent has been pegged, not momentarily busy.
+    idle — alive >= 10 minutes and never above 2% in a fully-covered 10-minute
+           window: plausibly wedged, worth a look (idle isn't proof of wedged,
+           so the UI words it as a question, not a verdict).
+    Both require the window to actually span the threshold duration — a
+    just-started series must not flag off two samples.
+    """
+    now = time.time()
+    with _history_lock:
+        hist = list(_history.get(key, ()))
+    trend = [c for _, c, _ in hist[-40:]]
+    if not hist:
+        return trend, None
+    span = now - hist[0][0]
+    win5 = [c for t, c, _ in hist if now - t <= 300]
+    win10 = [c for t, c, _ in hist if now - t <= 600]
+    if span >= 300 and win5 and sum(win5) / len(win5) >= 90.0:
+        return trend, "hot"
+    if span >= 600 and uptime_s >= 600 and win10 and max(win10) < 2.0:
+        return trend, "idle"
+    return trend, None
+
+
+def _sampler_loop() -> None:
+    """Keep history accruing while no browser is polling, so the dashboard
+    shows real trends the moment it's opened — without double-sampling when
+    the 3s frontend poll is already driving collection."""
+    while True:
+        time.sleep(3.0)
+        if time.monotonic() - _last_collect > 3.0:
+            try:
+                list_agents()
+            except Exception:
+                pass
+
 
 class Agent(BaseModel):
     pid: int
@@ -385,6 +481,9 @@ class Agent(BaseModel):
     # A signal won't stop it for good; `stop_hint` is the launchctl command that will.
     supervised: Optional[str] = None
     stop_hint: Optional[str] = None
+    # Recent CPU samples (sparkline) and the sustained-state flag ("hot"/"idle").
+    trend: list[float] = []
+    flag: Optional[str] = None
 
 
 def _collect() -> tuple[dict, dict, dict, dict]:
@@ -467,9 +566,12 @@ def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
 
 @app.get("/api/agents")
 def list_agents() -> dict:
+    global _last_collect
+    _maybe_reload_config()
     gpu = _cached("gpu", 2.0, _gpu_by_pid)
     jobs = _cached("launchd", 2.0, _launchd_jobs)
     now = time.time()
+    _last_collect = time.monotonic()
     meta, children, label_of, procmap = _collect()
     matched = set(label_of)
 
@@ -482,6 +584,7 @@ def list_agents() -> dict:
     ]
 
     agents: list[Agent] = []
+    current_keys: set[tuple[int, float]] = set()
     for root in roots:
         subtree = [root] + _descendants(root, children)
         cpu = mem = gpu_sum = 0.0
@@ -497,6 +600,14 @@ def list_agents() -> dict:
         rproc = procmap.get(root)
         cmd = _cmdline(rproc) if rproc else info["name"]
         ct = info["ct"] or now
+        hkey = (root, ct)
+        current_keys.add(hkey)
+        with _history_lock:
+            series = _history.get(hkey)
+            if series is None:
+                series = _history[hkey] = deque(maxlen=_HISTORY_MAX)
+            series.append((now, round(cpu, 1), round(mem, 1)))
+        trend, flag = _trend_and_flag(hkey, now - ct)
         agents.append(
             Agent(
                 pid=root,
@@ -515,6 +626,8 @@ def list_agents() -> dict:
                 ),
                 supervised=jobs.get(root),
                 stop_hint=_stop_hint(jobs[root]) if root in jobs else None,
+                trend=trend,
+                flag=flag,
             )
         )
 
@@ -523,12 +636,21 @@ def list_agents() -> dict:
         for pid in list(_handles):
             if pid not in live:
                 _handles.pop(pid, None)
+    with _history_lock:
+        for key in list(_history):
+            if key not in current_keys:
+                _history.pop(key, None)
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)
+    vm = psutil.virtual_memory()
     return {
         "agents": [a.model_dump() for a in agents],
         "host": psutil.os.uname().nodename if hasattr(psutil.os, "uname") else "",
         "cpu_count": psutil.cpu_count(),
+        "mem_total_mb": round(vm.total / (1024 * 1024), 0),
+        "mem_used_pct": vm.percent,
+        "config_path": str(CONFIG_PATH),
+        "config_error": CONFIG_ERROR,
         "ts": now,
     }
 
@@ -575,8 +697,50 @@ def _signal_tree(root: psutil.Process, force: bool) -> list[psutil.Process]:
     return signaled
 
 
+@app.get("/api/tree/{pid}")
+def agent_tree(pid: int) -> dict:
+    """The processes inside an agent's subtree — what a kill would actually hit.
+
+    Authorized exactly like kill: only a recognized agent root may be inspected,
+    so the endpoint can't be used to walk arbitrary process trees.
+    """
+    try:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        raise HTTPException(404, f"PID {pid} not found")
+    if _label_for(_match_target(proc)) is None:
+        raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
+
+    meta, children, _, procmap = _collect()
+    rows: list[dict] = []
+    stack: list[tuple[int, int]] = [(pid, 0)]
+    seen: set[int] = set()
+    while stack:
+        p, depth = stack.pop()
+        if p in seen or p not in meta:
+            continue
+        seen.add(p)
+        cpu, mem = _cpu_mem(p, procmap)
+        pr = procmap.get(p)
+        rows.append(
+            {
+                "pid": p,
+                "name": meta[p]["name"],
+                "cpu_percent": round(cpu, 1),
+                "mem_mb": round(mem, 1),
+                "cmdline": (_cmdline(pr) if pr else meta[p]["name"])[:200],
+                "depth": depth,
+            }
+        )
+        # reversed → DFS pops keep sibling order, so rows read parent-first
+        for child in reversed(children.get(p, [])):
+            stack.append((child, depth + 1))
+    return {"pid": pid, "tree": rows}
+
+
 @app.post("/api/kill/{pid}")
 def kill_agent(pid: int, force: bool = False) -> dict:
+    _maybe_reload_config()
     try:
         proc = psutil.Process(pid)
         proc.create_time()  # cache identity now — _signal_tree compares against it

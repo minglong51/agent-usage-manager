@@ -7,3 +7,4 @@ agents.local.yaml
 dist/
 build/
 *.egg-info/
+.gstack/
