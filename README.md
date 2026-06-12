@@ -3,7 +3,8 @@
 A tiny, single-file web dashboard for **headless AI agents** running on a machine —
 OpenClaw, Hermes, Claude Code, Ollama, vLLM, llama.cpp, or anything you name. It
 shows which agents are alive and what they're costing you (CPU, memory, GPU), and
-gives you a **kill button** per agent.
+gives you a **kill button** per agent. Think `htop`, scoped to just your agents —
+the [screenshot below](docs/dashboard.png) is a real run on a fleet node.
 
 No database, no auth layer, no dependencies beyond FastAPI + psutil. Runs on
 macOS and Linux. Meant to be cloned, configured, and run on any node in a fleet.
@@ -77,6 +78,27 @@ This is the important part — a web page that can kill processes needs guardrai
   without putting auth in front of it (reverse proxy + basic auth, SSH tunnel, etc.) —
   it has no built-in authentication.
 
+## Limits & known issues
+
+- **GPU column is NVIDIA-only.** Per-process GPU memory comes from
+  `nvidia-smi --query-compute-apps` — NVIDIA compute processes (CUDA), in
+  practice on Linux. AMD/Intel GPUs aren't read, graphics-only workloads don't
+  appear, and Apple Silicon has no per-process GPU accounting API at all, so
+  the column is hidden on Macs.
+- **Supervision detection is launchd-only (macOS, user domain).** Root
+  `LaunchDaemons` aren't flagged — that needs a privileged
+  `launchctl print system/…`. On Linux, systemd-supervised services
+  (`Restart=always`) aren't detected either, so killing one looks like it
+  failed when systemd respawns it — use `systemctl stop` for those.
+- **Same-user privileges only.** Signals are sent with the server's own
+  privileges. Agents running as another user (or root) are listed, but a kill
+  won't take (`killed: 0` in the response), and CPU/mem can read as 0 where
+  the OS denies access.
+- **History is in-memory.** Sparklines and the `hot`/`idle` flags (~20 min
+  window) rebuild from scratch after a server restart.
+- **Windows is untested.** Kill maps to `TerminateProcess` via psutil and may
+  work, but CI covers Linux + macOS only.
+
 ## Quick start
 
 **Recommended — one command, nothing to install first:**
@@ -148,8 +170,18 @@ the outermost `.app` **bundle name** is also included, so GUI agents that launch
 a generically-named binary (Kiro.app → `Electron`) are still matched by app name.
 
 `protect:` keeps a matched process listed but refuses to kill it; `ignore:`
-drops it from agent classification entirely. Point at a different file with
-`AGENTS_CONFIG=/path/to/agents.yaml`.
+drops it from agent classification entirely.
+
+**Which `agents.yaml` is used** — resolved once at startup, first hit wins:
+
+1. `AGENTS_CONFIG=/path/to/agents.yaml` env var (the `--config` flag sets this)
+2. `./agents.yaml` in the directory you launched from
+3. the default bundled with the package
+
+The dashboard header (and `list --json`) shows the resolved path, so you can
+always see which file is live. Hot-reload watches that one file. An
+`AGENTS_CONFIG` path that doesn't exist is an error at startup, not a silent
+fallback.
 
 ## launchd-supervised agents (macOS)
 
@@ -171,9 +203,8 @@ The kill endpoint refuses signals for these jobs (HTTP 409) and returns the same
 guidance, so the API never lies about a kill that won't stick. The message is
 tailored to the job: `KeepAlive` jobs are told a signal won't stick at all;
 `RunAtLoad`-only jobs are told a signal works now but the job restarts at next
-login. *Limitation:* detection runs in your user launchd domain, so root
-`LaunchDaemons` (which need a privileged `launchctl print system/…`) aren't
-flagged — a known gap, not silently handled.
+login. *Limitation:* root `LaunchDaemons` aren't flagged — see
+[Limits & known issues](#limits--known-issues).
 
 ## GPU notes
 
@@ -219,6 +250,27 @@ pytest -q
 CI runs the test suite on Linux + macOS (Python 3.9 and 3.12) on every push and PR.
 Cross-platform note: kill uses psutil's `terminate()`/`kill()`, which map to
 SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
+
+## Troubleshooting
+
+- **`pip install` fails building psutil** — no prebuilt wheel for your
+  Python/platform, so pip compiles it: you need a C toolchain and Python
+  headers (`xcode-select --install` on macOS; `apt install gcc python3-dev`
+  on Debian/Ubuntu). Or skip the problem with `uvx agent-usage-manager`.
+- **Dashboard is empty / "No matching agents running"** — first check which
+  config was picked up (resolution order above; the header shows the resolved
+  path). Then remember matching is against the executable basename + first few
+  arguments, not the full command line — a pattern that only appears deep in
+  the args won't match.
+- **Kill "doesn't work" — the agent comes back under a new PID** — it's
+  supervised. On macOS the row gets a `launchd` badge with the `launchctl
+  bootout` command that actually stops it; on Linux, systemd services aren't
+  detected (see limits) — `systemctl stop` them. A `killed: 0` in the kill
+  response means nothing was actually signaled (e.g. the agent runs as
+  another user).
+- **HTTP 403 on every request** — the DNS-rebinding guard refuses non-local
+  hostnames. Use `http://127.0.0.1:8765` (or a bare IP) instead of a custom
+  DNS name pointing at the box.
 
 ## License
 
