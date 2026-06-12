@@ -423,6 +423,40 @@ _history: dict[tuple[int, float], deque] = {}
 _history_lock = threading.Lock()
 _last_collect = 0.0  # monotonic time of the last full list_agents() pass
 
+# Restart churn. A crash-looping agent is invisible to hot/idle: every poll
+# shows a fresh pid whose history just started, so no per-incarnation window
+# ever fills (seen live: a KeepAlive launchd job respawning every second).
+# The durable identity across restarts is the matcher label, so deaths are
+# tracked per label: several young deaths in a short window means a supervisor
+# keeps respawning a process that keeps dying. All three dicts below are
+# guarded by _history_lock.
+_CHURN_LIFETIME_S = 120.0  # a death this young counts toward churn
+_CHURN_WINDOW_S = 600.0  # deaths are remembered this long
+_CHURN_MIN_DEATHS = 3  # young deaths in the window needed to flag
+_label_of_key: dict[tuple[int, float], str] = {}
+_churn_deaths: dict[str, deque] = {}
+
+
+def _note_death_locked(key: tuple[int, float], now: float) -> None:
+    """Record a vanished agent root (caller holds _history_lock)."""
+    label = _label_of_key.pop(key, None)
+    if label is None or now - key[1] > _CHURN_LIFETIME_S:
+        return
+    _churn_deaths.setdefault(label, deque(maxlen=64)).append(now)
+
+
+def _restarts_in_window(label: str, now: float) -> int:
+    with _history_lock:
+        dq = _churn_deaths.get(label)
+        if not dq:
+            return 0
+        while dq and now - dq[0] > _CHURN_WINDOW_S:
+            dq.popleft()
+        if not dq:
+            _churn_deaths.pop(label, None)
+            return 0
+        return len(dq)
+
 
 def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float], Optional[str]]:
     """Recent CPU series for the row sparkline, plus a sustained-state flag.
@@ -486,9 +520,13 @@ class Agent(BaseModel):
     # A signal won't stop it for good; `stop_hint` is the launchctl command that will.
     supervised: Optional[str] = None
     stop_hint: Optional[str] = None
-    # Recent CPU samples (sparkline) and the sustained-state flag ("hot"/"idle").
+    # Recent CPU samples (sparkline) and the sustained-state flag
+    # ("hot"/"idle"/"churn").
     trend: list[float] = []
     flag: Optional[str] = None
+    # Short-lived deaths under this label in the last 10 minutes (the count
+    # behind a "churn" flag; informative even below the flag threshold).
+    restarts: int = 0
 
 
 def _collect() -> tuple[dict, dict, dict, dict]:
@@ -612,7 +650,13 @@ def list_agents() -> dict:
             if series is None:
                 series = _history[hkey] = deque(maxlen=_HISTORY_MAX)
             series.append((now, round(cpu, 1), round(mem, 1)))
+            _label_of_key[hkey] = label_of[root]
         trend, flag = _trend_and_flag(hkey, now - ct)
+        restarts = _restarts_in_window(label_of[root], now)
+        if restarts >= _CHURN_MIN_DEATHS:
+            # Churn outranks hot/idle: a respawning process can't accrue
+            # either window, and the loop itself is the urgent signal.
+            flag = "churn"
         agents.append(
             Agent(
                 pid=root,
@@ -633,6 +677,7 @@ def list_agents() -> dict:
                 stop_hint=_stop_hint(jobs[root]) if root in jobs else None,
                 trend=trend,
                 flag=flag,
+                restarts=restarts,
             )
         )
 
@@ -645,6 +690,7 @@ def list_agents() -> dict:
         for key in list(_history):
             if key not in current_keys:
                 _history.pop(key, None)
+                _note_death_locked(key, now)
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)
     vm = psutil.virtual_memory()

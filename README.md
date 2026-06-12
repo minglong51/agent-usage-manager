@@ -42,9 +42,12 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
   SIGKILL after 3s. The confirm dialog tells you how many child processes will stop.
 - **Trends, not just snapshots.** Each row has a CPU sparkline (last ~20 min, sampled
   in the background even with no browser open), plus a **`hot 5m+`** badge when an
-  agent has been pegged ≥90% CPU for 5+ minutes and an **`idle 10m+`** badge when a
-  long-running agent has done nothing for 10+ minutes — the two states worth
-  investigating (runaway vs. possibly wedged).
+  agent has been pegged ≥90% CPU for 5+ minutes, an **`idle 10m+`** badge when a
+  long-running agent has done nothing for 10+ minutes, and a **`churn ×N`** badge when
+  the same agent has died young 3+ times in 10 minutes — the states worth investigating
+  (runaway, possibly wedged, crash-looping under a supervisor). Churn is what hot/idle
+  can't see: a crash-looping process is a fresh pid every poll, so no per-process
+  window ever fills.
 - **Expand the tree.** Click the `+N` badge to unfold an agent's child processes
   (per-child CPU/mem/command) — see what a kill would actually stop before clicking it.
 - **Config hot-reload.** Edits to `agents.yaml` apply on the next poll, no restart.

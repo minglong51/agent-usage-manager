@@ -197,6 +197,42 @@ def test_flags_need_sustained_window():
         m._history.pop(key, None)
 
 
+def test_churn_counts_young_deaths_per_label():
+    import time
+
+    import agent_usage_manager.app as m
+
+    now = time.time()
+    try:
+        with m._history_lock:
+            # three young deaths (lifetime < 120s) under one label → churn
+            for i, pid in enumerate((9001, 9002, 9003)):
+                key = (pid, now - 5.0)
+                m._label_of_key[key] = "looper"
+                m._note_death_locked(key, now - (3 - i))
+            # an old process dying must NOT count (lifetime way over 120s)
+            old = (9004, now - 7200)
+            m._label_of_key[old] = "looper"
+            m._note_death_locked(old, now)
+            # deaths under a different label stay separate
+            other = (9005, now - 5.0)
+            m._label_of_key[other] = "calm"
+            m._note_death_locked(other, now)
+        assert m._restarts_in_window("looper", now) == 3
+        assert m._restarts_in_window("calm", now) == 1
+        # outside the 10-minute window the deaths age out and the state clears
+        assert m._restarts_in_window("looper", now + 601) == 0
+        with m._history_lock:
+            assert "looper" not in m._churn_deaths
+    finally:
+        with m._history_lock:
+            m._churn_deaths.pop("looper", None)
+            m._churn_deaths.pop("calm", None)
+            for k in list(m._label_of_key):
+                if k[0] in (9001, 9002, 9003, 9004, 9005):
+                    m._label_of_key.pop(k)
+
+
 def test_csrf_guard_allows_same_origin_kill(client):
     # The dashboard's own fetch() sends a matching Origin; must pass the guard
     # (and then 404 on the unknown pid, proving it reached the endpoint).

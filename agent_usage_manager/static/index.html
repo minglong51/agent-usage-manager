@@ -34,6 +34,7 @@
           cursor: help; }
   .flag.hot { background: #da363333; color: #f85149; }
   .flag.idle { background: #30363d66; color: #8b949e; }
+  .flag.churn { background: #d2992233; color: #e3b341; }
   code.hint { font: 12px ui-monospace, Menlo, monospace; color: #adbac7;
               background: #161b22; border: 1px solid #21262d; border-radius: 6px;
               padding: 4px 8px; cursor: copy; white-space: nowrap; }
@@ -216,7 +217,9 @@ function rowHTML(x, cpus) {
     ? ` <span class="flag hot" title="CPU pegged ≥90% of a core for 5+ minutes — runaway?">hot 5m+</span>`
     : x.flag === "idle"
       ? ` <span class="flag idle" title="No CPU activity for 10+ minutes — wedged, or just waiting?">idle 10m+</span>`
-      : "";
+      : x.flag === "churn"
+        ? ` <span class="flag churn" title="${x.restarts} short-lived restarts in the last 10 minutes — crash-looping under a supervisor?">churn ×${x.restarts}</span>`
+        : "";
   // launchd-supervised jobs can't be stopped by a signal; show the real
   // command (click to copy) instead of dead-end kill buttons.
   const actions = x.supervised
