@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import psutil
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -98,8 +98,36 @@ def load_ignore(path: Optional[Path] = None) -> list[str]:
     return [str(p).lower() for p in (data.get("ignore") or [])]
 
 
+def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
+    """Optional `alerts:` block — a shell command to run when a flag appears.
+
+        alerts:
+          command: notify.py --plain "$AUM_MSG"
+          cooldown: 600   # seconds per (agent, flag) pair, default 600
+
+    Best-effort like load_ignore(): a malformed block means "no alerts", never
+    a startup failure.
+    """
+    path = path or CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    a = data.get("alerts")
+    if not isinstance(a, dict) or not a.get("command"):
+        return None
+    try:
+        cooldown = float(a.get("cooldown", 600))
+    except (TypeError, ValueError):
+        cooldown = 600.0
+    return {"command": str(a["command"]), "cooldown": cooldown}
+
+
 MATCHERS, PROTECT = load_config()
 IGNORE = load_ignore()
+ALERTS = load_alerts()
 SELF_PID = os.getpid()
 
 CONFIG_ERROR: Optional[str] = None
@@ -118,7 +146,7 @@ def _maybe_reload_config() -> None:
     it. The bad mtime is recorded so the file isn't re-parsed on every poll —
     only the next edit triggers another attempt.
     """
-    global MATCHERS, PROTECT, IGNORE, CONFIG_ERROR, _config_mtime
+    global MATCHERS, PROTECT, IGNORE, ALERTS, CONFIG_ERROR, _config_mtime
     try:
         mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
@@ -134,6 +162,7 @@ def _maybe_reload_config() -> None:
             return
         MATCHERS, PROTECT = matchers, protect
         IGNORE = load_ignore()
+        ALERTS = load_alerts()
         CONFIG_ERROR = None
 
 
@@ -458,18 +487,90 @@ def _restarts_in_window(label: str, now: float) -> int:
         return len(dq)
 
 
+# Alerting: a dashboard only helps while someone is looking at it (a real
+# crash loop once ran for 6 days unseen). When configured, a flag APPEARING
+# on a label runs the user's alert command. Fires on transitions only — an
+# ongoing condition alerts once, the dashboard owns ongoing state — with a
+# per-(label, flag) cooldown so a flapping flag can't spam.
+_alert_lock = threading.Lock()
+_prev_flag: dict[str, Optional[str]] = {}
+_last_alert: dict[tuple[str, str], float] = {}
+
+
+def _spawn_alert(command: str, a: "Agent", host: str) -> None:
+    # Runtime data rides environment variables, never the shell string — the
+    # command text itself comes only from the user's own config file.
+    env = {
+        **os.environ,
+        "AUM_MSG": (
+            f"[agent-usage-manager] {a.label} is {a.flag} on {host or 'this host'}: "
+            f"cpu {a.cpu_percent:.0f}%, mem {a.mem_mb:.0f}MB, "
+            f"restarts(10m) {a.restarts}, pid {a.pid}, up {int(a.uptime_s)}s"
+        ),
+        "AUM_LABEL": a.label,
+        "AUM_FLAG": a.flag or "",
+        "AUM_PID": str(a.pid),
+        "AUM_CPU": f"{a.cpu_percent:.1f}",
+        "AUM_MEM_MB": f"{a.mem_mb:.0f}",
+        "AUM_RESTARTS": str(a.restarts),
+        "AUM_HOST": host,
+    }
+    try:
+        subprocess.Popen(
+            command,
+            shell=True,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _check_alerts(agents: list["Agent"], now: float, host: str) -> None:
+    # Flags live per label (several rows can share one), so transitions are
+    # tracked per label too: first flagged row represents the label.
+    flagged: dict[str, Agent] = {}
+    seen: set[str] = set()
+    for a in agents:
+        seen.add(a.label)
+        if a.flag and a.label not in flagged:
+            flagged[a.label] = a
+    cfg = ALERTS
+    with _alert_lock:
+        for label, a in flagged.items():
+            if a.flag != _prev_flag.get(label) and cfg:
+                key = (label, a.flag)
+                if now - _last_alert.get(key, 0.0) >= cfg["cooldown"]:
+                    _last_alert[key] = now
+                    _spawn_alert(cfg["command"], a, host)
+        # Transitions are tracked even with no alert command configured, so
+        # enabling alerts later doesn't instantly fire for long-standing flags.
+        for label in seen:
+            a = flagged.get(label)
+            _prev_flag[label] = a.flag if a else None
+        for label in list(_prev_flag):
+            if label not in seen:
+                _prev_flag.pop(label)
+
+
 def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float], Optional[str]]:
     """Recent CPU series for the row sparkline, plus a sustained-state flag.
 
     hot  — mean CPU >= 90% of one core across a fully-covered 5-minute window:
            the agent has been pegged, not momentarily busy.
+    leak — RSS up >= 30% AND >= 128 MB across a fully-covered 15-minute
+           window, with the recent FLOOR above the old median: a sawtooth
+           (allocate, GC, repeat) dips back down and must not flag — only a
+           ratchet that never gives the memory back does.
     idle — alive >= 10 minutes with p95 CPU under 2% across a fully-covered
            10-minute window: plausibly wedged, worth a look (idle isn't proof
            of wedged, so the UI words it as a question, not a verdict). p95
            rather than max: a single GC/housekeeping blip in an otherwise dead
            process must not suppress the flag (seen live: an Electron agent at
            0.36% mean with one 2.9% sample).
-    Both require the window to actually span the threshold duration — a
+    All require the window to actually span the threshold duration — a
     just-started series must not flag off two samples.
     """
     now = time.time()
@@ -483,6 +584,20 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
     win10 = [c for t, c, _ in hist if now - t <= 600]
     if span >= 300 and win5 and sum(win5) / len(win5) >= 90.0:
         return trend, "hot"
+    if span >= 900 and uptime_s >= 900:
+        win15 = [(t, m) for t, _, m in hist if now - t <= 900]
+        if win15:
+            t0 = win15[0][0]
+            head = sorted(m for t, m in win15 if t - t0 <= 180)
+            tail = sorted(m for t, m in win15 if now - t <= 180)
+            if head and tail:
+                med_head, med_tail = head[len(head) // 2], tail[len(tail) // 2]
+                if (
+                    med_tail >= med_head * 1.3
+                    and med_tail - med_head >= 128.0
+                    and tail[0] > med_head
+                ):
+                    return trend, "leak"
     if span >= 600 and uptime_s >= 600 and win10:
         p95 = sorted(win10)[int(0.95 * (len(win10) - 1))]
         if p95 < 2.0:
@@ -521,7 +636,7 @@ class Agent(BaseModel):
     supervised: Optional[str] = None
     stop_hint: Optional[str] = None
     # Recent CPU samples (sparkline) and the sustained-state flag
-    # ("hot"/"idle"/"churn").
+    # ("hot"/"idle"/"churn"/"leak").
     trend: list[float] = []
     flag: Optional[str] = None
     # Short-lived deaths under this label in the last 10 minutes (the count
@@ -694,9 +809,14 @@ def list_agents() -> dict:
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)
     vm = psutil.virtual_memory()
+    host = psutil.os.uname().nodename if hasattr(psutil.os, "uname") else ""
+    # Alerts only in server mode (the sampler marks it): a one-shot `list`
+    # invocation inspecting current state must not fire notification commands.
+    if _sampler_started.is_set():
+        _check_alerts(agents, now, host)
     return {
         "agents": [a.model_dump() for a in agents],
-        "host": psutil.os.uname().nodename if hasattr(psutil.os, "uname") else "",
+        "host": host,
         "cpu_count": psutil.cpu_count(),
         "mem_total_mb": round(vm.total / (1024 * 1024), 0),
         "mem_used_pct": vm.percent,
@@ -858,6 +978,81 @@ def kill_agent(pid: int, force: bool = False) -> dict:
         "killed": len(gone),
         "still_running": len(alive),
     }
+
+
+_FLAG_VALUES = ("hot", "idle", "churn", "leak")
+
+
+def _prom_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+@app.get("/metrics")
+def metrics() -> PlainTextResponse:
+    """Prometheus text exposition, aggregated per agent label.
+
+    Per-label (not per-pid) on purpose: pids churn, and every dead pid would
+    linger as a stale Prometheus series. Multiple instances of one label are
+    summed (instances has the count); restarts takes the max since the
+    10-minute death count is already label-level.
+    """
+    data = list_agents()
+    by_label: dict[str, dict] = {}
+    for a in data["agents"]:
+        d = by_label.setdefault(
+            a["label"],
+            {"n": 0, "cpu": 0.0, "mem": 0.0, "gpu": 0.0, "has_gpu": False,
+             "restarts": 0, "flags": set()},
+        )
+        d["n"] += 1
+        d["cpu"] += a["cpu_percent"]
+        d["mem"] += a["mem_mb"]
+        if a["gpu_mem_mb"] is not None:
+            d["gpu"] += a["gpu_mem_mb"]
+            d["has_gpu"] = True
+        d["restarts"] = max(d["restarts"], a["restarts"])
+        if a["flag"]:
+            d["flags"].add(a["flag"])
+
+    out = [
+        "# HELP aum_agent_instances Matched process trees for this agent label",
+        "# TYPE aum_agent_instances gauge",
+        "# HELP aum_agent_cpu_percent Sum of tree CPU%% across instances (100 = one core)",
+        "# TYPE aum_agent_cpu_percent gauge",
+        "# HELP aum_agent_mem_mb Sum of tree RSS in MiB across instances",
+        "# TYPE aum_agent_mem_mb gauge",
+        "# HELP aum_agent_restarts_10m Short-lived deaths under this label in the last 10 minutes",
+        "# TYPE aum_agent_restarts_10m gauge",
+        "# HELP aum_agent_flag Sustained-state flag is currently raised (hot/idle/churn/leak)",
+        "# TYPE aum_agent_flag gauge",
+    ]
+    for label in sorted(by_label):
+        d = by_label[label]
+        ql = _prom_escape(label)
+        out.append(f'aum_agent_instances{{agent="{ql}"}} {d["n"]}')
+        out.append(f'aum_agent_cpu_percent{{agent="{ql}"}} {d["cpu"]:.1f}')
+        out.append(f'aum_agent_mem_mb{{agent="{ql}"}} {d["mem"]:.1f}')
+        out.append(f'aum_agent_restarts_10m{{agent="{ql}"}} {d["restarts"]}')
+        for f in _FLAG_VALUES:
+            out.append(
+                f'aum_agent_flag{{agent="{ql}",flag="{f}"}} {1 if f in d["flags"] else 0}'
+            )
+        if d["has_gpu"]:
+            out.append(f'aum_agent_gpu_mem_mb{{agent="{ql}"}} {d["gpu"]:.1f}')
+    out += [
+        "# HELP aum_agents Total matched agent instances",
+        "# TYPE aum_agents gauge",
+        f"aum_agents {len(data['agents'])}",
+        "# HELP aum_host_mem_used_percent Host memory in use",
+        "# TYPE aum_host_mem_used_percent gauge",
+        f"aum_host_mem_used_percent {data['mem_used_pct']}",
+        "# HELP aum_host_cpu_count Host logical CPU count",
+        "# TYPE aum_host_cpu_count gauge",
+        f"aum_host_cpu_count {data['cpu_count']}",
+    ]
+    return PlainTextResponse(
+        "\n".join(out) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
 
 
 @app.get("/")

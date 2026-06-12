@@ -47,7 +47,21 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
   the same agent has died young 3+ times in 10 minutes — the states worth investigating
   (runaway, possibly wedged, crash-looping under a supervisor). Churn is what hot/idle
   can't see: a crash-looping process is a fresh pid every poll, so no per-process
-  window ever fills.
+  window ever fills. A **`leak?`** badge fires when an agent's memory ratchets up
+  ≥30% (and ≥128 MB) over 15 minutes without coming back down.
+- **Alerts.** A dashboard only helps while you're looking at it. Add an `alerts:`
+  block to `agents.yaml` and any badge appearing runs your command (desktop
+  notification, Telegram bot, pager — anything) with the details in `$AUM_*` env
+  vars. Fires once per transition with a cooldown, never from the `list` CLI.
+
+  ```yaml
+  alerts:
+    command: 'terminal-notifier -title agents -message "$AUM_MSG"'
+    cooldown: 600
+  ```
+- **Prometheus `/metrics`.** Per-agent CPU/mem/instances/restarts and badge states
+  in text exposition format, aggregated per label (no pid-churn series bloat) —
+  point Grafana or any Prometheus scraper at `http://127.0.0.1:8765/metrics`.
 - **Expand the tree.** Click the `+N` badge to unfold an agent's child processes
   (per-child CPU/mem/command) — see what a kill would actually stop before clicking it.
 - **Config hot-reload.** Edits to `agents.yaml` apply on the next poll, no restart.

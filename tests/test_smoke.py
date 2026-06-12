@@ -197,6 +197,90 @@ def test_flags_need_sustained_window():
         m._history.pop(key, None)
 
 
+def test_leak_flag_needs_sustained_ratchet():
+    import time
+
+    import agent_usage_manager.app as m
+
+    now = time.time()
+    key = (99998, 123.0)
+
+    def series(mem_fn):
+        # 320 samples over ~16 min at 3s cadence; cpu 3% = neither hot nor idle
+        return m.deque(
+            [(now - 960 + i * 3, 3.0, mem_fn(i)) for i in range(320)], maxlen=400
+        )
+
+    try:
+        # steady ratchet: 200 MB → ~840 MB, never comes back down → leak
+        m._history[key] = series(lambda i: 200.0 + i * 2.0)
+        assert m._trend_and_flag(key, 1000)[1] == "leak"
+        # growth too small in absolute terms (~32 MB) → not a leak
+        m._history[key] = series(lambda i: 1000.0 + i * 0.1)
+        assert m._trend_and_flag(key, 1000)[1] is None
+        # ramp with periodic GC dips back below the old median → not a leak
+        m._history[key] = series(lambda i: 150.0 if i % 30 == 0 else 300.0 + i * 1.5)
+        assert m._trend_and_flag(key, 1000)[1] is None
+        # young process must not flag regardless of growth
+        m._history[key] = series(lambda i: 200.0 + i * 2.0)
+        assert m._trend_and_flag(key, 300)[1] is None
+    finally:
+        m._history.pop(key, None)
+
+
+def _agent(label, flag=None, **kw):
+    import agent_usage_manager.app as m
+
+    defaults = dict(
+        pid=1234, label=label, name="x", cmdline="x", status="running",
+        alive=True, cpu_percent=0.0, mem_mb=0.0, gpu_mem_mb=None,
+        uptime_s=5.0, child_count=0, protected=False, flag=flag,
+    )
+    defaults.update(kw)
+    return m.Agent(**defaults)
+
+
+def test_alerts_fire_on_transition_with_cooldown(monkeypatch):
+    import time
+
+    import agent_usage_manager.app as m
+
+    fired = []
+    monkeypatch.setattr(m, "ALERTS", {"command": "true", "cooldown": 600})
+    monkeypatch.setattr(m, "_spawn_alert", lambda cmd, a, host: fired.append(a.flag))
+    now = time.time()
+    try:
+        m._check_alerts([_agent("bot")], now, "h")  # no flag → nothing
+        assert fired == []
+        m._check_alerts([_agent("bot", "churn")], now, "h")  # appears → fires
+        assert fired == ["churn"]
+        m._check_alerts([_agent("bot", "churn")], now + 1, "h")  # ongoing → once
+        assert fired == ["churn"]
+        m._check_alerts([_agent("bot")], now + 2, "h")  # flag clears
+        m._check_alerts([_agent("bot", "churn")], now + 3, "h")  # flaps back → cooldown
+        assert fired == ["churn"]
+        m._check_alerts([_agent("bot")], now + 4, "h")
+        m._check_alerts([_agent("bot", "churn")], now + 700, "h")  # past cooldown
+        assert fired == ["churn", "churn"]
+        # a different flag has its own cooldown bucket
+        m._check_alerts([_agent("bot", "hot")], now + 701, "h")
+        assert fired == ["churn", "churn", "hot"]
+    finally:
+        with m._alert_lock:
+            m._prev_flag.pop("bot", None)
+            for k in list(m._last_alert):
+                if k[0] == "bot":
+                    m._last_alert.pop(k)
+
+
+def test_metrics_endpoint(client):
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "aum_agents " in r.text
+    assert "aum_host_cpu_count" in r.text
+
+
 def test_churn_counts_young_deaths_per_label():
     import time
 
