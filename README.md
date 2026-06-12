@@ -53,11 +53,14 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
   block to `agents.yaml` and any badge appearing runs your command (desktop
   notification, Telegram bot, pager — anything) with the details in `$AUM_*` env
   vars. Fires once per transition with a cooldown, never from the `list` CLI.
+  By default only `hot`/`churn`/`leak` alert — `idle` is the normal state of an
+  agent fleet that waits for work, so it's opt-in.
 
   ```yaml
   alerts:
     command: 'terminal-notifier -title agents -message "$AUM_MSG"'
     cooldown: 600
+    flags: [hot, churn, leak]   # the default; add idle to opt in
   ```
 - **Prometheus `/metrics`.** Per-agent CPU/mem/instances/restarts and badge states
   in text exposition format, aggregated per label (no pid-churn series bloat) —

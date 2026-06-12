@@ -61,13 +61,16 @@ ignore:
 # GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).
 # On Apple Silicon there is no per-process GPU API, so the GPU column is blank.
 
-# Optional: run a command when a badge (hot/idle/churn/leak) appears on an
-# agent — a dashboard only helps while someone is looking at it. The command
-# runs through the shell with details in env vars: $AUM_MSG (ready-made
-# one-liner), $AUM_LABEL, $AUM_FLAG, $AUM_PID, $AUM_CPU, $AUM_MEM_MB,
-# $AUM_RESTARTS, $AUM_HOST. Fires on a flag APPEARING (once per transition,
-# with a per-agent-per-flag cooldown); server mode only — `list` never alerts.
+# Optional: run a command when a badge appears on an agent — a dashboard only
+# helps while someone is looking at it. The command runs through the shell with
+# details in env vars: $AUM_MSG (ready-made one-liner), $AUM_LABEL, $AUM_FLAG,
+# $AUM_PID, $AUM_CPU, $AUM_MEM_MB, $AUM_RESTARTS, $AUM_HOST. Fires on a flag
+# APPEARING (once per transition, with a per-agent-per-flag cooldown); server
+# mode only — `list` never alerts. By default only hot/churn/leak alert: for a
+# fleet of agents that wait for work, idle is the NORMAL state, and alerting on
+# it floods the channel every time the server restarts and re-learns the fleet.
 #
 # alerts:
 #   command: 'terminal-notifier -title agent-usage-manager -message "$AUM_MSG"'
-#   cooldown: 600   # seconds, default 600
+#   cooldown: 600                # seconds, default 600
+#   flags: [hot, churn, leak]    # default; add idle only if you really want it

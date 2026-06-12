@@ -103,7 +103,13 @@ def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
 
         alerts:
           command: notify.py --plain "$AUM_MSG"
-          cooldown: 600   # seconds per (agent, flag) pair, default 600
+          cooldown: 600                # seconds per (agent, flag) pair
+          flags: [hot, churn, leak]    # which badges alert (the default)
+
+    `idle` is deliberately NOT in the default: for a fleet of agents that wait
+    for work, idle is the normal state — alerting on it turns the channel into
+    wallpaper (and every server restart would re-announce the whole idle
+    fleet as the windows refill). Opt in with an explicit `flags:` list.
 
     Best-effort like load_ignore(): a malformed block means "no alerts", never
     a startup failure.
@@ -122,7 +128,11 @@ def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
         cooldown = float(a.get("cooldown", 600))
     except (TypeError, ValueError):
         cooldown = 600.0
-    return {"command": str(a["command"]), "cooldown": cooldown}
+    raw_flags = a.get("flags", ["hot", "churn", "leak"])
+    if not isinstance(raw_flags, list):
+        raw_flags = ["hot", "churn", "leak"]
+    flags = {str(f).lower() for f in raw_flags}
+    return {"command": str(a["command"]), "cooldown": cooldown, "flags": flags}
 
 
 MATCHERS, PROTECT = load_config()
@@ -540,7 +550,7 @@ def _check_alerts(agents: list["Agent"], now: float, host: str) -> None:
     cfg = ALERTS
     with _alert_lock:
         for label, a in flagged.items():
-            if a.flag != _prev_flag.get(label) and cfg:
+            if a.flag != _prev_flag.get(label) and cfg and a.flag in cfg["flags"]:
                 key = (label, a.flag)
                 if now - _last_alert.get(key, 0.0) >= cfg["cooldown"]:
                     _last_alert[key] = now

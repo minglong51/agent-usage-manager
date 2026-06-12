@@ -246,12 +246,17 @@ def test_alerts_fire_on_transition_with_cooldown(monkeypatch):
     import agent_usage_manager.app as m
 
     fired = []
-    monkeypatch.setattr(m, "ALERTS", {"command": "true", "cooldown": 600})
+    monkeypatch.setattr(
+        m, "ALERTS", {"command": "true", "cooldown": 600, "flags": {"hot", "churn", "leak"}}
+    )
     monkeypatch.setattr(m, "_spawn_alert", lambda cmd, a, host: fired.append(a.flag))
     now = time.time()
     try:
         m._check_alerts([_agent("bot")], now, "h")  # no flag → nothing
         assert fired == []
+        m._check_alerts([_agent("bot", "idle")], now, "h")  # idle not in flags → silent
+        assert fired == []
+        m._check_alerts([_agent("bot")], now, "h")
         m._check_alerts([_agent("bot", "churn")], now, "h")  # appears → fires
         assert fired == ["churn"]
         m._check_alerts([_agent("bot", "churn")], now + 1, "h")  # ongoing → once
@@ -265,6 +270,18 @@ def test_alerts_fire_on_transition_with_cooldown(monkeypatch):
         # a different flag has its own cooldown bucket
         m._check_alerts([_agent("bot", "hot")], now + 701, "h")
         assert fired == ["churn", "churn", "hot"]
+        # default flag set comes from load_alerts when `flags:` is omitted
+        import pathlib, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "a.yaml"
+            p.write_text("agents:\n  - label: x\n    match: x\nalerts:\n  command: echo hi\n")
+            cfg = m.load_alerts(p)
+            assert cfg["flags"] == {"hot", "churn", "leak"}  # idle opt-in only
+            p.write_text(
+                "agents:\n  - label: x\n    match: x\n"
+                "alerts:\n  command: echo hi\n  flags: [idle]\n"
+            )
+            assert m.load_alerts(p)["flags"] == {"idle"}
     finally:
         with m._alert_lock:
             m._prev_flag.pop("bot", None)
