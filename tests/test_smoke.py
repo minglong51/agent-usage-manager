@@ -173,6 +173,17 @@ def test_flags_need_sustained_window():
             [(now - 660 + i * 3, 0.5, 100.0) for i in range(220)], maxlen=400
         )
         assert m._trend_and_flag(key, 700)[1] == "idle"
+        # a few isolated blips (GC, housekeeping) must not suppress idle (p95)
+        blippy = [(now - 660 + i * 3, 0.5, 100.0) for i in range(220)]
+        for j in (50, 120, 190):
+            blippy[j] = (blippy[j][0], 5.0, 100.0)
+        m._history[key] = m.deque(blippy, maxlen=400)
+        assert m._trend_and_flag(key, 700)[1] == "idle"
+        # sustained low-but-real activity is NOT idle
+        m._history[key] = m.deque(
+            [(now - 660 + i * 3, 3.0, 100.0) for i in range(220)], maxlen=400
+        )
+        assert m._trend_and_flag(key, 700)[1] is None
         # young series and short uptime must not flag
         m._history[key] = m.deque(
             [(now - 60 + i * 3, 95.0, 100.0) for i in range(20)], maxlen=400

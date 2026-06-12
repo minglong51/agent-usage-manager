@@ -429,9 +429,12 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
 
     hot  — mean CPU >= 90% of one core across a fully-covered 5-minute window:
            the agent has been pegged, not momentarily busy.
-    idle — alive >= 10 minutes and never above 2% in a fully-covered 10-minute
-           window: plausibly wedged, worth a look (idle isn't proof of wedged,
-           so the UI words it as a question, not a verdict).
+    idle — alive >= 10 minutes with p95 CPU under 2% across a fully-covered
+           10-minute window: plausibly wedged, worth a look (idle isn't proof
+           of wedged, so the UI words it as a question, not a verdict). p95
+           rather than max: a single GC/housekeeping blip in an otherwise dead
+           process must not suppress the flag (seen live: an Electron agent at
+           0.36% mean with one 2.9% sample).
     Both require the window to actually span the threshold duration — a
     just-started series must not flag off two samples.
     """
@@ -446,8 +449,10 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
     win10 = [c for t, c, _ in hist if now - t <= 600]
     if span >= 300 and win5 and sum(win5) / len(win5) >= 90.0:
         return trend, "hot"
-    if span >= 600 and uptime_s >= 600 and win10 and max(win10) < 2.0:
-        return trend, "idle"
+    if span >= 600 and uptime_s >= 600 and win10:
+        p95 = sorted(win10)[int(0.95 * (len(win10) - 1))]
+        if p95 < 2.0:
+            return trend, "idle"
     return trend, None
 
 
