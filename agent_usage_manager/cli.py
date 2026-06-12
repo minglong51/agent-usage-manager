@@ -1,9 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import threading
 import webbrowser
+
+
+def _bind_allowed(host: str, unsafe_expose: bool) -> bool:
+    """Fail closed on non-loopback binds.
+
+    This server carries a kill endpoint; binding it to a network interface on
+    a casual flag would leave one static token between the network and SIGKILL
+    for every agent on the box. "Put a proxy in front" is documentation, and
+    documentation is not a trust boundary — so anything that isn't loopback
+    refuses to start unless the user passes --unsafe-expose and owns the
+    consequence.
+    """
+    if unsafe_expose or host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _dur(s: float) -> str:
@@ -74,6 +93,13 @@ def main() -> None:
         action="store_true",
         help="Don't open the dashboard in a browser on startup.",
     )
+    parser.add_argument(
+        "--unsafe-expose",
+        action="store_true",
+        help="Allow binding to a non-loopback interface, exposing the kill API "
+        "to the network. You must put real auth (reverse proxy, SSH tunnel) "
+        "in front.",
+    )
     sub = parser.add_subparsers(dest="cmd")
     listp = sub.add_parser(
         "list", help="One-shot agent listing to stdout (no server) — for scripts and cron."
@@ -87,6 +113,13 @@ def main() -> None:
     if args.cmd == "list":
         _run_list(args.json)
         return
+
+    if not _bind_allowed(args.host, args.unsafe_expose):
+        parser.error(
+            f"refusing to bind {args.host}: a non-loopback bind exposes the "
+            "kill endpoint to the network. Pass --unsafe-expose if you really "
+            "mean it (and put auth in front)."
+        )
 
     import uvicorn
 

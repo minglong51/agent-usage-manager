@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -174,6 +177,89 @@ def _maybe_reload_config() -> None:
         IGNORE = load_ignore()
         ALERTS = load_alerts()
         CONFIG_ERROR = None
+
+
+def _state_dir() -> Path:
+    """Per-user state dir for the kill token and the action log.
+
+    Deliberately OUTSIDE the package and any project tree: agent sandboxes are
+    typically scoped to a working directory, so a file under the OS app-support
+    dir is readable by the operator but not by a sandboxed agent on the same
+    box — that asymmetry is what the kill token's security rests on.
+    macOS: ~/Library/Application Support; elsewhere: XDG state dir.
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return base / "agent-usage-manager"
+
+
+STATE_DIR = _state_dir()
+TOKEN_PATH = STATE_DIR / "kill_token"
+ACTION_LOG_PATH = STATE_DIR / "actions.log"
+
+
+def _load_kill_token() -> str:
+    """The static token that authorizes kill CALLERS. (The TARGET is authorized
+    separately, by the allowlist re-match in kill_agent — two different
+    questions: the re-match says what may be killed, the token says who may
+    kill.)
+
+    The monitored agents are themselves untrusted callers: any prompt-injected
+    agent with an HTTP tool and localhost reach can POST /api/kill, and Origin
+    headers are trivially forged outside a browser — so the browser guard
+    can't tell the operator's curl from an agent's. The boundary is file
+    permissions instead: a 0600 file under the user's app-support dir, which
+    the operator can read and a sandboxed agent can't. The token is NEVER
+    served over HTTP (any process that can curl this server could read it) —
+    the dashboard asks the operator to paste it once and keeps it in the
+    browser's localStorage, which same-host curl can't reach.
+
+    Auto-generated on first run; delete the file to rotate.
+    """
+    try:
+        tok = TOKEN_PATH.read_text().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tok = secrets.token_urlsafe(32)
+    fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(tok + "\n")
+    return tok
+
+
+KILL_TOKEN = _load_kill_token()
+
+_action_log_lock = threading.Lock()
+
+
+def _log_action(request: Request, pid: int, outcome: str, **extra) -> None:
+    """Append one JSON line per kill attempt — successes AND refusals.
+
+    A monitor that can kill must be able to answer "what was killed at 3am"
+    after the fact, and the refusal lines (403/409) are the interesting ones
+    when something on the box is probing the endpoint. Append-only, no
+    rotation: one line per kill attempt stays tiny. Best-effort like the
+    alert spawn — logging must never break the kill path itself.
+    """
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "client": f"{request.client.host}:{request.client.port}" if request.client else "?",
+        "pid": pid,
+        "outcome": outcome,
+        **extra,
+    }
+    try:
+        with _action_log_lock:
+            STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with open(ACTION_LOG_PATH, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 _SECRET_KV = re.compile(
@@ -832,6 +918,11 @@ def list_agents() -> dict:
         "mem_used_pct": vm.percent,
         "config_path": str(CONFIG_PATH),
         "config_error": CONFIG_ERROR,
+        # The PATH of the kill-token file, so the dashboard's paste prompt can
+        # point the operator at it. The path is not the secret — a curl-capable
+        # agent learning it changes nothing, since the file itself is 0600 and
+        # outside its sandbox.
+        "token_path": str(TOKEN_PATH),
         "ts": now,
     }
 
@@ -920,12 +1011,27 @@ def agent_tree(pid: int) -> dict:
 
 
 @app.post("/api/kill/{pid}")
-def kill_agent(pid: int, force: bool = False) -> dict:
+def kill_agent(pid: int, request: Request, force: bool = False) -> dict:
+    # Caller authorization comes FIRST and is a separate question from the
+    # target authorization below: the token says who may kill, the allowlist
+    # re-match says what may be killed. Without this gate, every monitored
+    # agent with an HTTP tool and localhost reach holds a fleet-wide kill
+    # switch (see _load_kill_token for the threat model). compare_digest on
+    # bytes: constant-time, and header values aren't guaranteed ASCII.
+    sent = request.headers.get("x-kill-token", "")
+    if not secrets.compare_digest(sent.encode(), KILL_TOKEN.encode()):
+        _log_action(request, pid, "403 wrong-token" if sent else "403 no-token")
+        raise HTTPException(
+            403,
+            "Kill requires the X-Kill-Token header — the token is in "
+            f"{TOKEN_PATH} (operator-readable file; never served over HTTP).",
+        )
     _maybe_reload_config()
     try:
         proc = psutil.Process(pid)
         proc.create_time()  # cache identity now — _signal_tree compares against it
     except psutil.NoSuchProcess:
+        _log_action(request, pid, "404 no-such-pid")
         raise HTTPException(404, f"PID {pid} not found")
 
     # Authorize exactly as listing does: a single _label_for(target) check.
@@ -935,8 +1041,10 @@ def kill_agent(pid: int, force: bool = False) -> dict:
     # through, which previously bypassed the ignore list).
     target = _match_target(proc)
     if _label_for(target) is None:
+        _log_action(request, pid, "403 not-an-agent", target=target[:120])
         raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
     if _is_protected(target, pid):
+        _log_action(request, pid, "403 protected", target=target[:120])
         raise HTTPException(403, f"PID {pid} is protected — refusing")
 
     # A launchd-supervised job is stopped via launchctl, not a signal — so route
@@ -953,6 +1061,7 @@ def kill_agent(pid: int, force: bool = False) -> dict:
             if _keepalive(label)
             else "a signal stops it now but launchd restarts it at next login (RunAtLoad)"
         )
+        _log_action(request, pid, "409 launchd-supervised", target=target[:120], job=label)
         raise HTTPException(
             409,
             f"PID {pid} is supervised by launchd (job '{label}') — {why}. "
@@ -961,13 +1070,15 @@ def kill_agent(pid: int, force: bool = False) -> dict:
         )
 
     signaled = _signal_tree(proc, force)
+    method = "kill" if force else "terminate"
     if not signaled and not proc.is_running():
         # Exited between authorization and signaling (is_running() is pid-reuse
         # aware) — report that rather than a fake "terminated".
+        _log_action(request, pid, "already exited", target=target[:120], method=method)
         return {
             "pid": pid,
             "result": "already exited",
-            "method": "kill" if force else "terminate",
+            "method": method,
             "killed": 0,
             "still_running": 0,
         }
@@ -981,10 +1092,15 @@ def kill_agent(pid: int, force: bool = False) -> dict:
         more_gone, alive = psutil.wait_procs(alive, timeout=3)
         gone += more_gone
 
+    result = "terminated" if not alive else "signal sent, some still running"
+    _log_action(
+        request, pid, result, target=target[:120], method=method,
+        killed=len(gone), still_running=len(alive),
+    )
     return {
         "pid": pid,
-        "result": "terminated" if not alive else "signal sent, some still running",
-        "method": "kill" if force else "terminate",
+        "result": result,
+        "method": method,
         "killed": len(gone),
         "still_running": len(alive),
     }

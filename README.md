@@ -6,8 +6,9 @@ shows which agents are alive and what they're costing you (CPU, memory, GPU), an
 gives you a **kill button** per agent. Think `htop`, scoped to just your agents —
 the [screenshot below](docs/dashboard.png) is a real run on a fleet node.
 
-No database, no auth layer, no dependencies beyond FastAPI + psutil. Runs on
-macOS and Linux. Meant to be cloned, configured, and run on any node in a fleet.
+No database, no auth framework (one static token file gates the kill switch),
+no dependencies beyond FastAPI + psutil. Runs on macOS and Linux. Meant to be
+cloned, configured, and run on any node in a fleet.
 
 ![agent-usage-manager — live dashboard](docs/dashboard.png)
 
@@ -94,9 +95,29 @@ This is the important part — a web page that can kill processes needs guardrai
   kill request carrying a foreign `Origin` is refused (CSRF guard) — so a
   malicious page can't kill your agents or read your process list. `curl` and
   the dashboard itself are unaffected.
-- **Bind local by default.** It listens on `127.0.0.1`. Don't expose it to a network
-  without putting auth in front of it (reverse proxy + basic auth, SSH tunnel, etc.) —
-  it has no built-in authentication.
+- **Kill requires a token (caller authorization).** The allowlist above says what
+  *may* be killed; the token says *who* may kill. The monitored agents are
+  themselves untrusted HTTP callers — a prompt-injected agent with an HTTP tool
+  and localhost reach could otherwise `POST /api/kill` and take down its
+  siblings (Origin headers are trivially forged outside a browser). The token is
+  auto-generated on first run into a `0600` file —
+  `~/Library/Application Support/agent-usage-manager/kill_token` on macOS,
+  `$XDG_STATE_HOME/agent-usage-manager/kill_token` (default
+  `~/.local/state/…`) elsewhere — and every kill must send it as an
+  `X-Kill-Token` header. It is **never served over HTTP** (anything that can
+  curl the dashboard could read it): the dashboard asks you to paste it once on
+  your first kill and keeps it in the browser's localStorage. Delete the file
+  to rotate the token.
+- **Action log.** Every kill attempt — success *and* every refusal — appends a
+  JSON line to `actions.log` next to the token file: timestamp, caller address,
+  target pid/command, outcome. "What was killed at 3am" and "what's been
+  probing the kill endpoint" both have an answer. Append-only, no rotation;
+  one line per attempt stays tiny.
+- **Non-loopback binds fail closed.** It listens on `127.0.0.1`; asking it to
+  bind anything else (`--host 0.0.0.0`, a LAN IP) refuses to start unless you
+  also pass `--unsafe-expose`. Exposing the port means one static token is all
+  that stands between the network and your agents — put real auth in front
+  (reverse proxy + basic auth, SSH tunnel, etc.) before using that flag.
 
 ## Limits & known issues
 
@@ -158,7 +179,9 @@ git clone <this-repo> && cd agent-usage-manager
 ```
 
 It opens the dashboard in your browser automatically. Flags: `--host`, `--port`,
-`--config /path/to/agents.yaml`, `--no-browser` (for headless/server use).
+`--config /path/to/agents.yaml`, `--no-browser` (for headless/server use),
+`--unsafe-expose` (required for any non-loopback `--host` — see
+[Safety](#safety)).
 
 ## Configure which processes are "agents"
 
@@ -238,7 +261,14 @@ on Macs — CPU and memory are the meaningful resource signals there.
   — each agent includes `trend` (recent CPU samples) and `flag` (`"hot"` / `"idle"` / `null`)
 - `GET  /api/tree/{pid}` → the agent's process subtree (per-child pid/name/cpu/mem/cmdline);
   only works on recognized agents, same authorization as kill
-- `POST /api/kill/{pid}?force=false` → SIGTERM (or SIGKILL with `force=true`)
+- `POST /api/kill/{pid}?force=false` → SIGTERM (or SIGKILL with `force=true`).
+  Requires the `X-Kill-Token` header — the token lives in the `0600` file shown
+  in the 403 message (see [Safety](#safety)):
+
+  ```bash
+  curl -X POST -H "X-Kill-Token: $(cat ~/Library/Application\ Support/agent-usage-manager/kill_token)" \
+    http://127.0.0.1:8765/api/kill/48213
+  ```
 
 ## Run as a service
 
@@ -291,6 +321,13 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 - **HTTP 403 on every request** — the DNS-rebinding guard refuses non-local
   hostnames. Use `http://127.0.0.1:8765` (or a bare IP) instead of a custom
   DNS name pointing at the box.
+- **HTTP 403 on kill only ("Kill requires the X-Kill-Token header")** — send
+  the token from the file named in the message. In the dashboard, the paste
+  prompt reappears on your next kill click (a stored stale token is forgotten
+  automatically when the server rejects it).
+- **"refusing to bind …" at startup** — non-loopback `--host` values fail
+  closed; add `--unsafe-expose` only with auth in front (see
+  [Safety](#safety)).
 
 ## License
 

@@ -70,6 +70,18 @@ def client():
     return TestClient(m.app, base_url="http://127.0.0.1")
 
 
+# The real kill token, as the operator would read it from the 0600 file.
+TOKEN = {"x-kill-token": m.KILL_TOKEN}
+
+
+@pytest.fixture(autouse=True)
+def action_log(tmp_path, monkeypatch):
+    # Test kills must not pollute the user's real audit log.
+    log = tmp_path / "actions.log"
+    monkeypatch.setattr(m, "ACTION_LOG_PATH", log)
+    return log
+
+
 def test_api_agents_ok(client):
     r = client.get("/api/agents")
     assert r.status_code == 200
@@ -82,16 +94,64 @@ def test_index_serves(client):
 
 
 def test_kill_pid1_refused(client):
-    # PID 1 is always protected
-    assert client.post("/api/kill/1").status_code == 403
+    # PID 1 is always protected (token supplied, so it's the target check firing)
+    assert client.post("/api/kill/1", headers=TOKEN).status_code == 403
 
 
 def test_kill_self_refused(client):
-    assert client.post(f"/api/kill/{os.getpid()}").status_code in (403, 404)
+    assert client.post(f"/api/kill/{os.getpid()}", headers=TOKEN).status_code in (403, 404)
 
 
 def test_kill_unknown_pid_404(client):
-    assert client.post("/api/kill/2147480000").status_code == 404
+    assert client.post("/api/kill/2147480000", headers=TOKEN).status_code == 404
+
+
+def test_kill_without_token_refused(client):
+    # The caller gate: monitored agents can curl this endpoint; without the
+    # token from the 0600 file they must get nothing but a 403.
+    r = client.post("/api/kill/2147480000")
+    assert r.status_code == 403
+    assert "X-Kill-Token" in r.json()["detail"]
+
+
+def test_kill_wrong_token_refused(client):
+    r = client.post("/api/kill/2147480000", headers={"x-kill-token": "not-the-token"})
+    assert r.status_code == 403
+
+
+def test_kill_with_token_reaches_target_auth(client):
+    # Right token → past the caller gate, into the target re-match (404 here
+    # proves the request reached the existing pid lookup, not the gate).
+    r = client.post("/api/kill/2147480000", headers=TOKEN)
+    assert r.status_code == 404
+
+
+def test_token_file_is_0600():
+    assert m.TOKEN_PATH.stat().st_mode & 0o777 == 0o600
+    assert m.TOKEN_PATH.read_text().strip() == m.KILL_TOKEN
+
+
+def test_kill_attempts_are_action_logged(client, action_log):
+    import json
+
+    client.post("/api/kill/2147480000")
+    client.post("/api/kill/1", headers=TOKEN)  # launchd: unmatched, refused
+    lines = [json.loads(s) for s in action_log.read_text().splitlines()]
+    assert [e["outcome"] for e in lines] == ["403 no-token", "403 not-an-agent"]
+    assert lines[0]["pid"] == 2147480000
+    assert all(e["ts"] and e["client"] for e in lines)
+
+
+def test_bind_fails_closed_without_unsafe_expose():
+    from agent_usage_manager.cli import _bind_allowed
+
+    assert _bind_allowed("127.0.0.1", False)
+    assert _bind_allowed("localhost", False)
+    assert _bind_allowed("::1", False)
+    assert not _bind_allowed("0.0.0.0", False)
+    assert not _bind_allowed("::", False)
+    assert not _bind_allowed("192.168.1.50", False)
+    assert _bind_allowed("0.0.0.0", True)  # the explicit scary flag
 
 
 def test_host_guard_blocks_dns_rebinding(client):
@@ -339,6 +399,6 @@ def test_csrf_guard_allows_same_origin_kill(client):
     # (and then 404 on the unknown pid, proving it reached the endpoint).
     r = client.post(
         "/api/kill/2147480000",
-        headers={"origin": "http://127.0.0.1", "host": "127.0.0.1"},
+        headers={"origin": "http://127.0.0.1", "host": "127.0.0.1", **TOKEN},
     )
     assert r.status_code == 404

@@ -109,6 +109,7 @@ const cfgEl = document.getElementById("cfg");
 const empty = document.getElementById("empty");
 const stale = document.getElementById("stale");
 let lastOk = null;          // timestamp of the last successful /api/agents fetch
+let tokenPath = "";         // where the kill token lives on disk (from /api/agents)
 const expanded = new Set(); // pids whose process subtree is unfolded
 const bodies = new Map();   // pid -> its <tbody> (one tbody per agent: row + children)
 
@@ -149,15 +150,39 @@ function spark(trend) {
     <polyline points="${pts}"></polyline></svg>`;
 }
 
+// Kill needs the X-Kill-Token header. The server NEVER serves the token over
+// HTTP — any process that can curl this page could read it, and the monitored
+// agents are exactly the callers the token exists to stop. So the operator
+// pastes it once (from the 0600 token file the server points at) and it stays
+// in this browser's localStorage, out of reach of same-host curl.
+function killToken() {
+  let t = localStorage.getItem("killToken");
+  if (!t) {
+    t = (prompt("First kill from this browser — paste the kill token.\n" +
+                "It's in: " + (tokenPath || "the server's app-support dir") +
+                "\n(Stored in this browser; you won't be asked again.)") || "").trim();
+    if (t) localStorage.setItem("killToken", t);
+  }
+  return t;
+}
+
 async function kill(pid, force, children) {
   const verb = force ? "FORCE KILL (SIGKILL)" : "kill (SIGTERM)";
   const kids = children > 0
     ? ` and its ${children} child process${children > 1 ? "es" : ""}`
     : "";
   if (!confirm(verb + " PID " + pid + kids + "?")) return;
+  const token = killToken();
+  if (!token) return;
   try {
-    const r = await fetch(`/api/kill/${pid}?force=${force}`, {method: "POST"});
+    const r = await fetch(`/api/kill/${pid}?force=${force}`,
+                          {method: "POST", headers: {"X-Kill-Token": token}});
     const j = await r.json();
+    if (r.status === 403 && (j.detail || "").includes("X-Kill-Token")) {
+      // wrong/rotated token — forget it so the next kill re-prompts
+      localStorage.removeItem("killToken");
+      throw new Error("kill token rejected (rotated?) — you'll be asked to paste it again");
+    }
     if (!r.ok) throw new Error(j.detail || r.status);
     errEl.className = "meta ok";
     errEl.textContent = `✓ ${j.result} (${j.killed} process${j.killed===1?"":"es"})`;
@@ -268,6 +293,7 @@ async function refresh() {
     return;
   }
   lastOk = new Date();
+  tokenPath = data.token_path || tokenPath;
 
   const a = data.agents;
   const totCpu = a.reduce((s, x) => s + x.cpu_percent, 0);
