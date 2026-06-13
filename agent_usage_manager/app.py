@@ -246,6 +246,8 @@ def _log_action(request: Request, pid: int, outcome: str, **extra) -> None:
     rotation: one line per kill attempt stays tiny. Best-effort like the
     alert spawn — logging must never break the kill path itself.
     """
+    if "target" in extra:
+        extra["target"] = _redact(str(extra["target"]))
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "client": f"{request.client.host}:{request.client.port}" if request.client else "?",
