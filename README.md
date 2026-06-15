@@ -7,8 +7,9 @@ gives you a **kill button** per agent. Think `htop`, scoped to just your agents 
 the [screenshot below](docs/dashboard.png) is a real run on a fleet node.
 
 No database, no auth framework (one static token file gates the kill switch),
-no dependencies beyond FastAPI + psutil. Runs on macOS and Linux. Meant to be
-cloned, configured, and run on any node in a fleet.
+no dependencies beyond FastAPI + psutil. Runs on macOS and Linux. It is a
+per-node monitor and guarded local control panel: fleet schedulers may consume
+its read-only telemetry, but should own their own scheduling and actuation.
 
 ![agent-usage-manager — live dashboard](docs/dashboard.png)
 
@@ -75,6 +76,19 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
 - **Kill-safe table.** Rows keep a stable order (sorted by label) and never reorder
   while your pointer is over the table, so the kill button can't shift under your
   cursor mid-click.
+
+## Product boundary
+
+`agent-usage-manager` is intentionally **not** a fleet scheduler, dispatcher, or
+multi-host orchestrator. It answers local process questions: what agent process is
+running here, what resources is its process tree using, did it enter a suspicious
+state, and can this local operator safely stop it?
+
+If you run a separate fleet control plane, treat AUM as an optional read-only
+input. Scrape `list --json`, `/api/agents`, or `/metrics` for local OS facts, then
+make scheduling, budget, restart, and kill/retire decisions in your own
+deterministic control layer. Do not route irreversible fleet operations through
+AUM's kill endpoint as a central substrate.
 
 ## Safety
 
@@ -258,7 +272,10 @@ on Macs — CPU and memory are the meaningful resource signals there.
 ## API
 
 - `GET  /api/agents` → `{ agents: [...], host, cpu_count, mem_total_mb, mem_used_pct, config_path, config_error, ts }`
-  — each agent includes `trend` (recent CPU samples) and `flag` (`"hot"` / `"idle"` / `null`)
+  — each agent includes read-only telemetry such as `pid`, `label`, resource totals,
+  recent CPU `trend`, flags (`hot`, `idle`, `churn`, `leak` when present), protection
+  state, and supervised-process guidance. This endpoint is suitable as an input to
+  external tools, not as a fleet-control contract.
 - `GET  /api/tree/{pid}` → the agent's process subtree (per-child pid/name/cpu/mem/cmdline);
   only works on recognized agents, same authorization as kill
 - `POST /api/kill/{pid}?force=false` → SIGTERM (or SIGKILL with `force=true`).
@@ -300,6 +317,17 @@ pytest -q
 CI runs the test suite on Linux + macOS (Python 3.9 and 3.12) on every push and PR.
 Cross-platform note: kill uses psutil's `terminate()`/`kill()`, which map to
 SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
+
+## Release notes
+
+### 0.2.1 — security and verification hardening
+
+- Kill endpoint now requires caller authorization via the static token file.
+- Non-loopback binds fail closed unless `--unsafe-expose` is explicitly passed.
+- Kill attempts and refusals append to the local action log.
+- Added deterministic kill-path regression tests, including pid/create_time pins.
+- Added synthetic hot/idle/churn/leak trace fixtures.
+- Added adversarial matcher cases so lookalike process names stay test-covered.
 
 ## Troubleshooting
 
