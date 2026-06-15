@@ -179,10 +179,13 @@ def test_csrf_guard_blocks_null_origin_kill(client):
 
 def test_api_agents_has_system_fields(client):
     body = client.get("/api/agents").json()
+    assert body["api_version"] == 1
+    assert body["aum_version"]
     assert body["config_path"]
     assert body["mem_total_mb"] > 0
     for a in body["agents"]:
         assert "trend" in a and "flag" in a
+        assert "create_time" in a
 
 
 def test_tree_refuses_non_agent(client):
@@ -292,7 +295,7 @@ def _agent(label, flag=None, **kw):
     import agent_usage_manager.app as m
 
     defaults = dict(
-        pid=1234, label=label, name="x", cmdline="x", status="running",
+        pid=1234, create_time=1.0, label=label, name="x", cmdline="x", status="running",
         alive=True, cpu_percent=0.0, mem_mb=0.0, gpu_mem_mb=None,
         uptime_s=5.0, child_count=0, protected=False, flag=flag,
     )

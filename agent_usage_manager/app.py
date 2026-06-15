@@ -12,6 +12,7 @@ import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -24,6 +25,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE = Path(__file__).parent
+AUM_API_VERSION = 1
+try:
+    AUM_VERSION = version("agent-usage-manager")
+except PackageNotFoundError:
+    AUM_VERSION = "0+unknown"
 
 
 def _resolve_config() -> Path:
@@ -718,6 +724,9 @@ def _sampler_loop() -> None:
 
 class Agent(BaseModel):
     pid: int
+    # Process start time from the OS. Consumers should pair this with pid when
+    # caching rows so PID reuse does not make two different agents look identical.
+    create_time: float
     label: str
     name: str
     cmdline: str
@@ -873,6 +882,7 @@ def list_agents() -> dict:
         agents.append(
             Agent(
                 pid=root,
+                create_time=round(ct, 3),
                 label=label_of[root],
                 name=info["name"],
                 cmdline=cmd[:300],
@@ -913,6 +923,8 @@ def list_agents() -> dict:
     if _sampler_started.is_set():
         _check_alerts(agents, now, host)
     return {
+        "api_version": AUM_API_VERSION,
+        "aum_version": AUM_VERSION,
         "agents": [a.model_dump() for a in agents],
         "host": host,
         "cpu_count": psutil.cpu_count(),

@@ -271,11 +271,13 @@ on Macs — CPU and memory are the meaningful resource signals there.
 
 ## API
 
-- `GET  /api/agents` → `{ agents: [...], host, cpu_count, mem_total_mb, mem_used_pct, config_path, config_error, ts }`
-  — each agent includes read-only telemetry such as `pid`, `label`, resource totals,
-  recent CPU `trend`, flags (`hot`, `idle`, `churn`, `leak` when present), protection
-  state, and supervised-process guidance. This endpoint is suitable as an input to
-  external tools, not as a fleet-control contract.
+- `GET  /api/agents` → `{ api_version, aum_version, agents: [...], host, cpu_count, mem_total_mb, mem_used_pct, config_path, config_error, ts }`
+  — each agent includes read-only telemetry such as `pid`, `create_time`, `label`,
+  resource totals, recent CPU `trend`, flags (`hot`, `idle`, `churn`, `leak` when
+  present), protection state, and supervised-process guidance. Pair `pid` with
+  `create_time` when caching rows so PID reuse cannot alias two different agents.
+  This endpoint is suitable as an input to external tools, not as a fleet-control
+  contract.
 - `GET  /api/tree/{pid}` → the agent's process subtree (per-child pid/name/cpu/mem/cmdline);
   only works on recognized agents, same authorization as kill
 - `POST /api/kill/{pid}?force=false` → SIGTERM (or SIGKILL with `force=true`).
@@ -319,6 +321,12 @@ Cross-platform note: kill uses psutil's `terminate()`/`kill()`, which map to
 SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 
 ## Release notes
+
+### 0.2.2 — unreleased
+
+- Added `api_version` and `aum_version` to `/api/agents` and `list --json`.
+- Added per-agent `create_time` so external telemetry consumers can pair it with
+  `pid` and avoid PID-reuse aliasing.
 
 ### 0.2.1 — security and verification hardening
 
