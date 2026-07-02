@@ -94,3 +94,6 @@ alerts:
   command: 'PATH="$HOME/.local/bin:$PATH" "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority alert --text "$AUM_MSG"'
   cooldown: 1800                 # 30 min per (agent, flag)
   flags: [hot, churn, leak]
+  leak_floor_mb: 1536            # bots legitimately ratchet RSS as session
+                                 # context grows; only push leak alerts once
+                                 # the absolute footprint is actually large

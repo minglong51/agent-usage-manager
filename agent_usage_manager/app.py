@@ -114,11 +114,19 @@ def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
           command: notify.py --plain "$AUM_MSG"
           cooldown: 600                # seconds per (agent, flag) pair
           flags: [hot, churn, leak]    # which badges alert (the default)
+          leak_floor_mb: 1536          # leak alerts only above this RSS (default 0)
 
     `idle` is deliberately NOT in the default: for a fleet of agents that wait
     for work, idle is the normal state — alerting on it turns the channel into
     wallpaper (and every server restart would re-announce the whole idle
     fleet as the windows refill). Opt in with an explicit `flags:` list.
+
+    `leak_floor_mb` gates only the leak ALERT, not the badge: an agent that
+    accrues working state (a chat session growing its context) ratchets RSS
+    exactly like a leaker, so the relative-growth heuristic alone pushes noise
+    for processes hundreds of MB small. Below the floor the badge still shows
+    on the dashboard; the push waits until the absolute footprint is worth a
+    human's attention.
 
     Best-effort like load_ignore(): a malformed block means "no alerts", never
     a startup failure.
@@ -141,7 +149,16 @@ def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
     if not isinstance(raw_flags, list):
         raw_flags = ["hot", "churn", "leak"]
     flags = {str(f).lower() for f in raw_flags}
-    return {"command": str(a["command"]), "cooldown": cooldown, "flags": flags}
+    try:
+        leak_floor_mb = float(a.get("leak_floor_mb", 0))
+    except (TypeError, ValueError):
+        leak_floor_mb = 0.0
+    return {
+        "command": str(a["command"]),
+        "cooldown": cooldown,
+        "flags": flags,
+        "leak_floor_mb": leak_floor_mb,
+    }
 
 
 def load_tmux_labels(path: Optional[Path] = None) -> Optional[re.Pattern]:
@@ -719,13 +736,18 @@ def _spawn_alert(command: str, a: "Agent", host: str) -> None:
 def _check_alerts(agents: list["Agent"], now: float, host: str) -> None:
     # Flags live per label (several rows can share one), so transitions are
     # tracked per label too: first flagged row represents the label.
+    cfg = ALERTS
+    leak_floor = cfg.get("leak_floor_mb", 0.0) if cfg else 0.0
     flagged: dict[str, Agent] = {}
     seen: set[str] = set()
     for a in agents:
         seen.add(a.label)
+        # A below-floor leak is tracked as unflagged, not merely muted: the
+        # appearance must fire later, when the ratchet crosses the floor.
+        if a.flag == "leak" and a.mem_mb < leak_floor:
+            continue
         if a.flag and a.label not in flagged:
             flagged[a.label] = a
-    cfg = ALERTS
     with _alert_lock:
         for label, a in flagged.items():
             if a.flag != _prev_flag.get(label) and cfg and a.flag in cfg["flags"]:
