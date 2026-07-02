@@ -670,6 +670,15 @@ _CHURN_MIN_DEATHS = 3  # young deaths in the window needed to flag
 _label_of_key: dict[tuple[int, float], str] = {}
 _churn_deaths: dict[str, deque] = {}
 
+# A single window's ratchet can be a transient child (seen live: a headless
+# Chrome PDF render adding ~1.5 GB to a bot's subtree for under a minute — the
+# whole tail slice is elevated, so the sawtooth guard passes). The condition
+# must hold continuously for a second full window before flagging: a burst
+# stops matching minutes after the child exits, a real leak never stops.
+# Guarded by _history_lock.
+_LEAK_SUSTAIN_S = 900.0
+_leak_since: dict[tuple[int, float], float] = {}
+
 
 def _note_death_locked(key: tuple[int, float], now: float) -> None:
     """Record a vanished agent root (caller holds _history_lock)."""
@@ -771,9 +780,12 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
     hot  — mean CPU >= 90% of one core across a fully-covered 5-minute window:
            the agent has been pegged, not momentarily busy.
     leak — RSS up >= 30% AND >= 128 MB across a fully-covered 15-minute
-           window, with the recent FLOOR above the old median: a sawtooth
-           (allocate, GC, repeat) dips back down and must not flag — only a
-           ratchet that never gives the memory back does.
+           window, with the recent FLOOR above the old median, AND that
+           condition holding continuously for _LEAK_SUSTAIN_S: a sawtooth
+           (allocate, GC, repeat) dips back down and must not flag, and a
+           transient heavyweight child (a headless-browser render) elevates
+           one window but stops matching once it exits — only a ratchet that
+           never gives the memory back does.
     idle — alive >= 10 minutes with p95 CPU under 2% across a fully-covered
            10-minute window: plausibly wedged, worth a look (idle isn't proof
            of wedged, so the UI words it as a question, not a verdict). p95
@@ -795,6 +807,7 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
     if span >= 300 and win5 and sum(win5) / len(win5) >= 90.0:
         return trend, "hot"
     if span >= 900 and uptime_s >= 900:
+        leak_now = False
         win15 = [(t, m) for t, _, m in hist if now - t <= 900]
         if win15:
             t0 = win15[0][0]
@@ -802,12 +815,18 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
             tail = sorted(m for t, m in win15 if now - t <= 180)
             if head and tail:
                 med_head, med_tail = head[len(head) // 2], tail[len(tail) // 2]
-                if (
+                leak_now = (
                     med_tail >= med_head * 1.3
                     and med_tail - med_head >= 128.0
                     and tail[0] > med_head
-                ):
+                )
+        with _history_lock:
+            if leak_now:
+                since = _leak_since.setdefault(key, now)
+                if now - since >= _LEAK_SUSTAIN_S:
                     return trend, "leak"
+            else:
+                _leak_since.pop(key, None)
     if span >= 600 and uptime_s >= 600 and win10:
         p95 = sorted(win10)[int(0.95 * (len(win10) - 1))]
         if p95 < 2.0:
@@ -1025,6 +1044,7 @@ def list_agents() -> dict:
         for key in list(_history):
             if key not in current_keys:
                 _history.pop(key, None)
+                _leak_since.pop(key, None)
                 _note_death_locked(key, now)
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)

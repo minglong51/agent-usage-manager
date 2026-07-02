@@ -275,12 +275,17 @@ def test_leak_flag_needs_sustained_ratchet():
         )
 
     try:
-        # steady ratchet: 200 MB → ~840 MB, never comes back down → leak
+        # steady ratchet: 200 MB → ~840 MB, never comes back down → arms the
+        # sustain clock but must not flag until it has held for _LEAK_SUSTAIN_S
         m._history[key] = series(lambda i: 200.0 + i * 2.0)
+        assert m._trend_and_flag(key, 1000)[1] is None
+        assert key in m._leak_since
+        m._leak_since[key] = now - m._LEAK_SUSTAIN_S
         assert m._trend_and_flag(key, 1000)[1] == "leak"
-        # growth too small in absolute terms (~32 MB) → not a leak
+        # growth too small in absolute terms (~32 MB) → not a leak, disarms
         m._history[key] = series(lambda i: 1000.0 + i * 0.1)
         assert m._trend_and_flag(key, 1000)[1] is None
+        assert key not in m._leak_since
         # ramp with periodic GC dips back below the old median → not a leak
         m._history[key] = series(lambda i: 150.0 if i % 30 == 0 else 300.0 + i * 1.5)
         assert m._trend_and_flag(key, 1000)[1] is None
@@ -289,6 +294,7 @@ def test_leak_flag_needs_sustained_ratchet():
         assert m._trend_and_flag(key, 300)[1] is None
     finally:
         m._history.pop(key, None)
+        m._leak_since.pop(key, None)
 
 
 def _agent(label, flag=None, **kw):

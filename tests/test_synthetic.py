@@ -65,10 +65,15 @@ def test_trace_fixture_flags_as_specified(name):
     try:
         with m._history_lock:
             m._history[key] = _series(now, duration, fn)
+            if expected == "leak":
+                # setdefault keeps a backdated arm time, exercising the
+                # already-sustained path in one call
+                m._leak_since[key] = now - m._LEAK_SUSTAIN_S
         assert m._trend_and_flag(key, uptime)[1] == expected
     finally:
         with m._history_lock:
             m._history.pop(key, None)
+            m._leak_since.pop(key, None)
 
 
 class FakeProc:
@@ -124,6 +129,9 @@ def _cleanup_label(label: str, pids: tuple) -> None:
         for k in list(m._history):
             if k[0] in pids:
                 m._history.pop(k)
+        for k in list(m._leak_since):
+            if k[0] in pids:
+                m._leak_since.pop(k)
     with m._alert_lock:
         m._prev_flag.pop(label, None)
 
@@ -165,6 +173,7 @@ def test_leaker_flag_surfaces_in_api_row(monkeypatch):
     try:
         with m._history_lock:
             m._history[(pid, ct)] = _series(now, 1200, lambda t: (5.0, 200.0 + t / 3.0))
+            m._leak_since[(pid, ct)] = now - m._LEAK_SUSTAIN_S
         row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
         assert row["flag"] == "leak"
     finally:
