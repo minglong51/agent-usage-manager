@@ -63,7 +63,14 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
     command: 'terminal-notifier -title agents -message "$AUM_MSG"'
     cooldown: 600
     flags: [hot, churn, leak]   # the default; add idle to opt in
+    leak_floor_mb: 1536         # optional: leak alerts only above this RSS
   ```
+
+  `leak_floor_mb` mutes leak *alerts* (the badge still shows) until the agent's
+  absolute footprint crosses the floor — agents that accrue working state, like
+  a chat bot growing its session context, ratchet RSS exactly like leakers, so
+  relative growth alone can be noisy. Crossing the floor counts as the
+  appearance, so a genuine ratchet still alerts.
 - **Prometheus `/metrics`.** Per-agent CPU/mem/instances/restarts and badge states
   in text exposition format, aggregated per label (no pid-churn series bloat) —
   point Grafana or any Prometheus scraper at `http://127.0.0.1:8765/metrics`.
