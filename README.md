@@ -229,6 +229,23 @@ a generically-named binary (Kiro.app → `Electron`) are still matched by app na
 `protect:` keeps a matched process listed but refuses to kill it; `ignore:`
 drops it from agent classification entirely.
 
+**Telling identical agents apart (`tmux_labels:`)** — a fleet of same-binary
+agents (say five `claude` bots, one per tmux session) all hits one `agents:`
+entry and shows N indistinguishable rows; a distinguishing flag deeper in
+their command lines is invisible to matching *by design* (see above). When
+each instance runs in its own tmux session, the session name is its identity:
+
+```yaml
+tmux_labels: "^bot-(.+)$"   # session bot-coder_1 → row label coder_1
+```
+
+If a matched agent root (or an ancestor) is a tmux pane process whose session
+name matches the regex, the row's label becomes the first capture group (the
+whole session name if there's no group). Churn tracking, alert transitions,
+and `/metrics` series all use the derived label, so each instance gets its own
+state. Sessions that don't match the regex keep their `agents:` label, and the
+key is ignored where tmux isn't installed or running.
+
 **Which `agents.yaml` is used** — resolved once at startup, first hit wins:
 
 1. `AGENTS_CONFIG=/path/to/agents.yaml` env var (the `--config` flag sets this)
@@ -327,6 +344,8 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 - Added `api_version` and `aum_version` to `/api/agents` and `list --json`.
 - Added per-agent `create_time` so external telemetry consumers can pair it with
   `pid` and avoid PID-reuse aliasing.
+- Added `tmux_labels:` — derive per-instance row labels from tmux session names,
+  so a fleet of identical agents stops rendering as N indistinguishable rows.
 
 ### 0.2.1 — security and verification hardening
 

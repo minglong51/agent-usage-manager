@@ -144,9 +144,44 @@ def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
     return {"command": str(a["command"]), "cooldown": cooldown, "flags": flags}
 
 
+def load_tmux_labels(path: Optional[Path] = None) -> Optional[re.Pattern]:
+    """Optional `tmux_labels:` regex — per-instance labels from tmux sessions.
+
+        tmux_labels: "^bot-(.+)$"    # session bot-coder_1 → row label coder_1
+
+    A fleet of identical agents (several claude-code bots, one per tmux
+    session) all hit the same `agents:` entry and land as N indistinguishable
+    rows. Their cmdlines can't tell them apart — the match target is
+    deliberately the executable + first args only (see _target_from_argv), so
+    a distinguishing flag deeper in argv is invisible on purpose — but the
+    tmux session each one runs in IS its durable identity. When a matched
+    root (or one of its ancestors) is a tmux pane process whose session name
+    matches this regex, the row is labeled with the first capture group (the
+    whole session name if the regex has no group). Sessions that don't match
+    keep their `agents:` label, so incidental tmux use never renames rows.
+
+    Best-effort like load_ignore(): absent or malformed means "off".
+    """
+    path = path or CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pattern = data.get("tmux_labels")
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
+
 MATCHERS, PROTECT = load_config()
 IGNORE = load_ignore()
 ALERTS = load_alerts()
+TMUX_LABELS = load_tmux_labels()
 SELF_PID = os.getpid()
 
 CONFIG_ERROR: Optional[str] = None
@@ -165,7 +200,7 @@ def _maybe_reload_config() -> None:
     it. The bad mtime is recorded so the file isn't re-parsed on every poll —
     only the next edit triggers another attempt.
     """
-    global MATCHERS, PROTECT, IGNORE, ALERTS, CONFIG_ERROR, _config_mtime
+    global MATCHERS, PROTECT, IGNORE, ALERTS, TMUX_LABELS, CONFIG_ERROR, _config_mtime
     try:
         mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
@@ -182,6 +217,7 @@ def _maybe_reload_config() -> None:
         MATCHERS, PROTECT = matchers, protect
         IGNORE = load_ignore()
         ALERTS = load_alerts()
+        TMUX_LABELS = load_tmux_labels()
         CONFIG_ERROR = None
 
 
@@ -444,6 +480,54 @@ def _launchd_jobs() -> dict[int, str]:
 def _stop_hint(label: str) -> str:
     """The appropriate `launchctl` command to actually stop a supervised job."""
     return f"launchctl bootout gui/{os.getuid()}/{label}"
+
+
+def _tmux_panes() -> dict[int, str]:
+    """Map pane pid → tmux session name for every live pane.
+
+    Empty when tmux is absent or no server is running. The pid comes first in
+    the format string because session names may themselves contain spaces.
+    """
+    if not shutil.which("tmux"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    panes: dict[int, str] = {}
+    for line in out.splitlines():
+        pid_s, _, session = line.partition(" ")
+        if pid_s.isdigit() and session:
+            panes[int(pid_s)] = session
+    return panes
+
+
+def _instance_label(root: int, base: str, meta: dict, panes: dict[int, str]) -> str:
+    """Display label for one agent root: tmux-derived when configured and
+    applicable, else the matcher label.
+
+    Nearest enclosing pane wins: the root often IS the pane process (a shell
+    that exec'd the agent), otherwise the ancestor walk finds the pane shell
+    that spawned it. A root inside a session that doesn't match the
+    `tmux_labels:` regex keeps the base label — the walk stops at its own
+    pane rather than borrowing an outer session's name.
+    """
+    rx = TMUX_LABELS
+    if rx and panes:
+        for pid in (root, *_ancestors(root, meta)):
+            session = panes.get(pid)
+            if session is None:
+                continue
+            mo = rx.search(session)
+            if mo:
+                return (mo.group(1) if mo.groups() else mo.group(0)) or base
+            break
+    return base
 
 
 def _gpu_by_pid() -> dict[int, float]:
@@ -835,6 +919,7 @@ def list_agents() -> dict:
     _maybe_reload_config()
     gpu = _cached("gpu", 2.0, _gpu_by_pid)
     jobs = _cached("launchd", 2.0, _launchd_jobs)
+    panes = _cached("tmux", 2.0, _tmux_panes) if TMUX_LABELS else {}
     now = time.time()
     _last_collect = time.monotonic()
     meta, children, label_of, procmap = _collect()
@@ -864,6 +949,11 @@ def list_agents() -> dict:
         info = meta[root]
         rproc = procmap.get(root)
         cmd = _cmdline(rproc) if rproc else info["name"]
+        # The per-instance label (tmux-derived when configured) is used for
+        # everything identity-shaped downstream — churn tracking, alert
+        # transitions, /metrics series — so a fleet of same-matcher bots gets
+        # per-bot state instead of one blurred series.
+        label = _instance_label(root, label_of[root], meta, panes)
         ct = info["ct"] or now
         hkey = (root, ct)
         current_keys.add(hkey)
@@ -872,9 +962,9 @@ def list_agents() -> dict:
             if series is None:
                 series = _history[hkey] = deque(maxlen=_HISTORY_MAX)
             series.append((now, round(cpu, 1), round(mem, 1)))
-            _label_of_key[hkey] = label_of[root]
+            _label_of_key[hkey] = label
         trend, flag = _trend_and_flag(hkey, now - ct)
-        restarts = _restarts_in_window(label_of[root], now)
+        restarts = _restarts_in_window(label, now)
         if restarts >= _CHURN_MIN_DEATHS:
             # Churn outranks hot/idle: a respawning process can't accrue
             # either window, and the loop itself is the urgent signal.
@@ -883,7 +973,7 @@ def list_agents() -> dict:
             Agent(
                 pid=root,
                 create_time=round(ct, 3),
-                label=label_of[root],
+                label=label,
                 name=info["name"],
                 cmdline=cmd[:300],
                 status=info["status"],

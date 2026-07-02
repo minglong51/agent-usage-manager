@@ -58,6 +58,17 @@ ignore:
   - shipit        # Squirrel.framework auto-updater
   - kiro-cli-term # Kiro's integrated-terminal shells (zsh), not the agent
 
+# Optional: per-instance labels from tmux session names. A fleet of identical
+# agents (e.g. several claude-code bots, one per tmux session bot-*) all hit
+# one agents: entry above and land as N indistinguishable rows — their
+# cmdlines can't tell them apart, because matching deliberately sees only the
+# executable + first args. The tmux session each one runs in IS its identity:
+# when a matched root (or an ancestor) is a tmux pane whose session name
+# matches this regex, the row is labeled with the first capture group (the
+# whole session name if there is no group). Sessions that don't match keep
+# their agents: label, so incidental tmux use never renames rows.
+tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
+
 # GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).
 # On Apple Silicon there is no per-process GPU API, so the GPU column is blank.
 
@@ -70,7 +81,16 @@ ignore:
 # fleet of agents that wait for work, idle is the NORMAL state, and alerting on
 # it floods the channel every time the server restarts and re-learns the fleet.
 #
-# alerts:
-#   command: 'terminal-notifier -title agent-usage-manager -message "$AUM_MSG"'
-#   cooldown: 600                # seconds, default 600
-#   flags: [hot, churn, leak]    # default; add idle only if you really want it
+# Example (desktop notification):
+#   alerts:
+#     command: 'terminal-notifier -title agent-usage-manager -message "$AUM_MSG"'
+#     cooldown: 600              # seconds, default 600
+#     flags: [hot, churn, leak]  # default; add idle only if you really want it
+#
+# Live wiring on this host: push through the fleet's Telegram sender. notify.py
+# is a `uv run` script and uv lives in ~/.local/bin, which the launchd service's
+# PATH doesn't include — hence the inline PATH prefix.
+alerts:
+  command: 'PATH="$HOME/.local/bin:$PATH" "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority alert --text "$AUM_MSG"'
+  cooldown: 1800                 # 30 min per (agent, flag)
+  flags: [hot, churn, leak]
