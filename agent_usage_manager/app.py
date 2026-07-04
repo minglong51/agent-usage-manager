@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -26,6 +27,7 @@ from pydantic import BaseModel
 
 BASE = Path(__file__).parent
 AUM_API_VERSION = 1
+log = logging.getLogger("agent_usage_manager")
 try:
     AUM_VERSION = version("agent-usage-manager")
 except PackageNotFoundError:
@@ -488,9 +490,10 @@ def _launchd_jobs() -> dict[int, str]:
         parts = line.split("\t")
         if len(parts) >= 3:
             pid_s = parts[0].strip()
+            label = parts[2].strip()
             # Not-running jobs show "-" in the PID column; skip those.
-            if pid_s.isdigit() and int(pid_s) > 0:
-                jobs[int(pid_s)] = parts[2].strip()
+            if pid_s.isdigit() and int(pid_s) > 0 and not label.startswith("application."):
+                jobs[int(pid_s)] = label
     return jobs
 
 
@@ -729,17 +732,46 @@ def _spawn_alert(command: str, a: "Agent", host: str) -> None:
         "AUM_RESTARTS": str(a.restarts),
         "AUM_HOST": host,
     }
+    key = (a.label, a.flag or "")
+    stamped = _last_alert.get(key)
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             command,
             shell=True,
             env=env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             start_new_session=True,
         )
-    except OSError:
-        pass
+    except OSError as e:
+        log.error(
+            "alert command failed to start for %s/%s — cooldown not charged: %s",
+            key[0], key[1], e,
+        )
+        if _last_alert.get(key) == stamped:
+            _last_alert.pop(key, None)
+        return
+
+    def _confirm() -> None:
+        try:
+            _, err = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            log.error(
+                "alert command still running after 60s for %s/%s — delivery unconfirmed",
+                key[0], key[1],
+            )
+            return
+        if proc.returncode != 0:
+            log.error(
+                "alert command exited %s for %s/%s — delivery failed, cooldown not charged: %s",
+                proc.returncode, key[0], key[1],
+                (err or b"").decode(errors="replace").strip()[:500],
+            )
+            with _alert_lock:
+                if _last_alert.get(key) == stamped:
+                    _last_alert.pop(key, None)
+
+    threading.Thread(target=_confirm, name="aum-alert-confirm", daemon=True).start()
 
 
 def _check_alerts(agents: list["Agent"], now: float, host: str) -> None:
@@ -1227,6 +1259,15 @@ def kill_agent(pid: int, request: Request, force: bool = False) -> dict:
             "method": method,
             "killed": 0,
             "still_running": 0,
+        }
+    if not signaled:
+        _log_action(request, pid, "no processes signaled", target=target[:120], method=method)
+        return {
+            "pid": pid,
+            "result": "no processes signaled",
+            "method": method,
+            "killed": 0,
+            "still_running": 1,
         }
     gone, alive = psutil.wait_procs(signaled, timeout=3)
     if alive and not force:  # graceful terminate didn't take — escalate to kill
