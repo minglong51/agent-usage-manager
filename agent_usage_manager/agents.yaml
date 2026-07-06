@@ -90,8 +90,10 @@ tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
 # Live wiring on this host: push through the fleet's Telegram sender. notify.py
 # is a `uv run` script and uv lives in ~/.local/bin, which the launchd service's
 # PATH doesn't include — hence the inline PATH prefix.
+# Quiet hours 23:00-07:59: record to the attention feed instead of ringing the
+# phone — the item rides the 08:30 digest (a midnight churn badge can wait).
 alerts:
-  command: 'PATH="$HOME/.local/bin:$PATH" "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority alert --text "$AUM_MSG"'
+  command: 'PATH="$HOME/.local/bin:$PATH"; H=$(date +%H); Q=""; if [ "$H" -ge 23 ] || [ "$H" -lt 8 ]; then Q="--feed-only"; fi; "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority alert $Q --text "$AUM_MSG"'
   cooldown: 1800                 # 30 min per (agent, flag)
   flags: [hot, churn, leak]
   leak_floor_mb: 1536            # bots legitimately ratchet RSS as session
