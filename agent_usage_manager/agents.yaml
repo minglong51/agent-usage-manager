@@ -96,7 +96,7 @@ tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
 # GAVE UP, cron-health, sync-bot liveness). `hot` dropped from alerting
 # entirely; notify.py is a `uv run` script, hence the inline PATH prefix.
 alerts:
-  command: 'PATH="$HOME/.local/bin:$PATH"; "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority digest --feed-only --text "$AUM_MSG"'
+  command: 'PATH="$HOME/.local/bin:$PATH"; "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority digest --source usage-manager --feed-only --text "$AUM_MSG"'
   cooldown: 7200                 # 2 h per (agent, flag)
   flags: [churn, leak]
   leak_floor_mb: 1536            # bots legitimately ratchet RSS as session
