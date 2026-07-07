@@ -87,15 +87,18 @@ tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
 #     cooldown: 600              # seconds, default 600
 #     flags: [hot, churn, leak]  # default; add idle only if you really want it
 #
-# Live wiring on this host: push through the fleet's Telegram sender. notify.py
-# is a `uv run` script and uv lives in ~/.local/bin, which the launchd service's
-# PATH doesn't include — hence the inline PATH prefix.
-# Quiet hours 23:00-07:59: record to the attention feed instead of ringing the
-# phone — the item rides the 08:30 digest (a midnight churn badge can wait).
+# Live wiring on this host: record to the attention feed, never ring
+# (2026-07-06, Ming: "most of them are noise"). First live day pushed two false
+# positives — "codex churn" during legitimate spawn work and "claude-code hot"
+# during a working session; for inference agents, pegged-CPU IS the job.
+# Badges stay live on the dashboard + machinery panel; the feed line rides the
+# next digest. Genuine breakage has louder, independent signals (mcp-autoheal
+# GAVE UP, cron-health, sync-bot liveness). `hot` dropped from alerting
+# entirely; notify.py is a `uv run` script, hence the inline PATH prefix.
 alerts:
-  command: 'PATH="$HOME/.local/bin:$PATH"; H=$(date +%H); Q=""; if [ "$H" -ge 23 ] || [ "$H" -lt 8 ]; then Q="--feed-only"; fi; "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority alert $Q --text "$AUM_MSG"'
-  cooldown: 1800                 # 30 min per (agent, flag)
-  flags: [hot, churn, leak]
+  command: 'PATH="$HOME/.local/bin:$PATH"; "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority digest --feed-only --text "$AUM_MSG"'
+  cooldown: 7200                 # 2 h per (agent, flag)
+  flags: [churn, leak]
   leak_floor_mb: 1536            # bots legitimately ratchet RSS as session
                                  # context grows; only push leak alerts once
                                  # the absolute footprint is actually large
