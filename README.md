@@ -346,6 +346,14 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 
 ## Release notes
 
+### 0.2.3 — startup fixes
+
+- The browser now opens once the port actually accepts, instead of on a fixed
+  1s timer. A cold `uvx` run outran the timer and landed on connection-refused.
+- No more `/favicon.ico` 404.
+- Dropped two inaccurate README claims ("single-file"; "no dependencies beyond
+  FastAPI + psutil" — there are four).
+
 ### 0.2.2 — telemetry identity and fleet labels
 
 - Added `api_version` and `aum_version` to `/api/agents` and `list --json`.

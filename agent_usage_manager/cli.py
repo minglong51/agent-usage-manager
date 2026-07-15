@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import socket
 import threading
+import time
 import webbrowser
 
 
@@ -23,6 +25,23 @@ def _bind_allowed(host: str, unsafe_expose: bool) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _open_when_ready(url: str, host: str, port: int, timeout: float = 15.0) -> None:
+    """Open the browser only once the port accepts, never on a fixed delay.
+
+    A cold first run (uvx resolving the env, then importing fastapi/uvicorn)
+    outruns any guess, and the browser lands on connection-refused. On timeout
+    we stay silent: the URL is already on stdout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                webbrowser.open(url)
+                return
+        except OSError:
+            time.sleep(0.1)
 
 
 def _dur(s: float) -> str:
@@ -128,7 +147,9 @@ def main() -> None:
     print(f"agent-usage-manager → {url}")
 
     if not args.no_browser:
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        threading.Thread(
+            target=_open_when_ready, args=(url, open_host, args.port), daemon=True
+        ).start()
 
     uvicorn.run("agent_usage_manager.app:app", host=args.host, port=args.port)
 
