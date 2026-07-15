@@ -1,13 +1,13 @@
 # agent-usage-manager
 
-A tiny, single-file web dashboard for **headless AI agents** running on a machine —
+A small web dashboard for **headless AI agents** running on a machine —
 OpenClaw, Hermes, Claude Code, Ollama, vLLM, llama.cpp, or anything you name. It
 shows which agents are alive and what they're costing you (CPU, memory, GPU), and
 gives you a **kill button** per agent. Think `htop`, scoped to just your agents —
 the [screenshot below](docs/dashboard.png) is a real run on a fleet node.
 
 No database, no auth framework (one static token file gates the kill switch),
-no dependencies beyond FastAPI + psutil. Runs on macOS and Linux. It is a
+four direct dependencies (FastAPI, uvicorn, psutil, PyYAML). Runs on macOS and Linux. It is a
 per-node monitor and guarded local control panel: fleet schedulers may consume
 its read-only telemetry, but should own their own scheduling and actuation.
 
