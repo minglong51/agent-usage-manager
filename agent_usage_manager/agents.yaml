@@ -57,6 +57,10 @@ ignore:
   - crashpad      # chrome_crashpad_handler — the bundle's crash reporter
   - shipit        # Squirrel.framework auto-updater
   - kiro-cli-term # Kiro's integrated-terminal shells (zsh), not the agent
+  - autoupdate    # Sparkle's Autoupdate helper — Codex.app's ShipIt equivalent
+  - updater       # Sparkle's Updater.app; argv[1] is the app path, so it matches
+  - for chrome    # "Codex for Chrome" extension host, not the agent
+  - tmux attach   # tmux clients: `attach -t <session>` carries the agent's name
 
 # Optional: per-instance labels from tmux session names. A fleet of identical
 # agents (e.g. several claude-code bots, one per tmux session bot-*) all hit

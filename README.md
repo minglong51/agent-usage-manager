@@ -346,6 +346,15 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 
 ## Release notes
 
+### 0.2.4 — stop reporting non-agents
+
+- `ignore:` now covers Sparkle's `Autoupdate`/`Updater` (Codex.app's equivalent of
+  Squirrel's ShipIt), the "Codex for Chrome" extension host, and `tmux attach`
+  clients — a session named `workspace-claude` matched the claude pattern via the
+  `-t` argument.
+- Dogfooded against `ps` on a live 10-agent fleet: 22 rows → 17, with all six
+  removals confirmed as not agents and every real agent retained.
+
 ### 0.2.3 — startup fixes
 
 - The browser now opens once the port actually accepts, instead of on a fixed
