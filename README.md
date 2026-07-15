@@ -346,7 +346,7 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 
 ## Release notes
 
-### 0.2.2 — unreleased
+### 0.2.2 — telemetry identity and fleet labels
 
 - Added `api_version` and `aum_version` to `/api/agents` and `list --json`.
 - Added per-agent `create_time` so external telemetry consumers can pair it with
