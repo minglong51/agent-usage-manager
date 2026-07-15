@@ -142,6 +142,15 @@ This is the important part — a web page that can kill processes needs guardrai
 
 ## Limits & known issues
 
+- **Matching is a heuristic and it over-matches.** An agent's identity usually
+  lives in its arguments (`node .../bin/codex`), and a GUI agent's real name is
+  its `.app` bundle (Kiro launches a binary called `Electron`) — so the match
+  target is the executable basename plus the first few args plus the bundle
+  name. The cost is that anything living inside an agent's `.app` (updaters,
+  crash handlers, helpers) and any process that names an agent in its first
+  args (`tmux attach -t workspace-claude`) can be misclassified as that agent.
+  `ignore:` is the escape hatch. The bundled list is not exhaustive and can't
+  be — every new agent ships new helpers under its own name.
 - **GPU column is NVIDIA-only.** Per-process GPU memory comes from
   `nvidia-smi --query-compute-apps` — NVIDIA compute processes (CUDA), in
   practice on Linux. AMD/Intel GPUs aren't read, graphics-only workloads don't
