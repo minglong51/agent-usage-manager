@@ -81,33 +81,34 @@ def parse_map(text: str) -> dict[str, list[str]]:
     return owners
 
 
-def git_ignored(paths: list[str]) -> set[str]:
-    """Subset of `paths` the repo's own .gitignore excludes.
+def tracked_dirs() -> set[str]:
+    """Every directory prefix containing at least one tracked file.
 
-    Build artifacts (`*.egg-info/`, `build/`, `dist/`) exist at test time in CI but
-    not in a fresh checkout, so a hardcoded skip list silently diverges per repo.
-    Deferring to .gitignore means the answer matches whatever the repo already
-    declares as not-source.
+    A package is what the repo actually versions. Local scratch (`db/`, `reports/`),
+    generated output (`public/`, `src/assets/`) and build artifacts (`*.egg-info/`)
+    all have zero tracked files, and none of them exist in a fresh clone — so a
+    checker that walks the filesystem sees a different repo depending on whose
+    machine it runs on. Asking git what is tracked removes that variance entirely,
+    and subsumes .gitignore (an ignored dir tracks nothing).
     """
-    if not paths:
-        return set()
-    proc = subprocess.run(
-        ("git", "-C", str(REPO), "check-ignore", "--stdin"),
-        input="\n".join(paths),
-        capture_output=True,
-        text=True,
-    )
-    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    prefixes: set[str] = set()
+    for path in git("ls-files").splitlines():
+        parts = path.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            prefixes.add("/".join(parts[:i]) + "/")
+    return prefixes
 
 
 def subdirs(rel: str) -> set[str]:
-    names = [
+    tracked = tracked_dirs()
+    return {
         f"{rel}{p.name}/"
         for p in (REPO / rel).iterdir()
-        if p.is_dir() and not p.name.startswith(".") and p.name not in SKIP_DIRS
-    ]
-    ignored = git_ignored(names)
-    return {n for n in names if n not in ignored and n.rstrip("/") not in ignored}
+        if p.is_dir()
+        and not p.name.startswith(".")
+        and p.name not in SKIP_DIRS
+        and f"{rel}{p.name}/" in tracked
+    }
 
 
 def packages(rows: set[str]) -> set[str]:
