@@ -21,16 +21,21 @@ at any depth. Do not fork it per repo.
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 CONTRACT_NAMES = ("AGENTS.md", "CLAUDE.md")
-FENCE = re.compile(r"^```design-doc-map\s*$(.*?)^```\s*$", re.M | re.S)
+CODE_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".sh"}
+FENCE = re.compile(r"^```design-doc-map\s*$(.*?)^```\s*$", re.MULTILINE | re.DOTALL)
 SKIP_DIRS = {"__pycache__", "node_modules", "venv", ".venv"}
 IS_TEST = re.compile(
     r"(^|/)(test[_\-.][^/]+|[^/]+[_\-.](test|spec))\.(py|sh|ts|js|mjs|cjs|tsx|jsx)$"
 )
+# Generated migration revisions: the tool writes one file per schema change, and the
+# schema itself is what a design doc documents — not each revision.
+IS_GENERATED = re.compile(r"(^|/)(migrations|alembic)/versions/")
 
 
 def repo_root() -> Path:
@@ -54,7 +59,9 @@ def contract_files() -> list[Path]:
 
 def contract_path() -> Path:
     """The contract file carrying the map. Prefers AGENTS.md when both have it."""
-    candidates = [p for p in contract_files() if FENCE.search(p.read_text(encoding="utf-8"))]
+    candidates = [
+        p for p in contract_files() if FENCE.search(p.read_text(encoding="utf-8"))
+    ]
     if not candidates:
         raise ValueError(
             f"no ```design-doc-map fence in {[p.name for p in contract_files()]} at {REPO}"
@@ -153,7 +160,9 @@ def drift(doc: str, paths: list[str]) -> dict[str, object]:
         return {"doc": doc, "untracked": True, "added": [], "removed": [], "commits": 0}
 
     def modules(filt: str) -> list[str]:
-        out = git("diff", f"--diff-filter={filt}", "--name-only", f"{sha}..HEAD", "--", *paths)
+        out = git(
+            "diff", f"--diff-filter={filt}", "--name-only", f"{sha}..HEAD", "--", *paths
+        )
         return [p for p in out.splitlines() if p and not IS_TEST.search(p)]
 
     return {
@@ -213,8 +222,56 @@ def test_map_has_no_stale_rows(owners):
     assert not stale, f"design-doc-map rows for paths that no longer exist: {stale}"
 
 
+def unnamed_modules(owners: dict[str, list[str]]) -> list[str]:
+    """Tracked modules no design doc names anywhere.
+
+    The drift report only diffs FORWARD from a doc's own last change, so staleness
+    that predates an incomplete refresh is invisible to it forever — paws described a
+    `scene.js` renderer for three weeks after it became `wool.js`, and no number of
+    drift runs could have said so. This asks the orthogonal question instead: does any
+    doc mention this file at all? Slower and coarser, hence a separate `--audit` pass
+    rather than part of the default report.
+    """
+    docs = " ".join(
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in sorted((REPO / "docs" / "design").glob("*.md"))
+    )
+    exempt = tuple(path for path, own in owners.items() if not own)
+    out: list[str] = []
+    for rel in git("ls-files").splitlines():
+        path = Path(rel)
+        if path.suffix not in CODE_SUFFIXES or IS_TEST.search(rel):
+            continue
+        if path.name == "__init__.py" or rel.endswith((".d.ts", ".min.js")):
+            continue
+        if "/vendor/" in f"/{rel}" or IS_GENERATED.search(rel):
+            continue
+        if exempt and rel.startswith(exempt):
+            continue
+        if path.name not in docs:
+            out.append(rel)
+    return out
+
+
 def main() -> None:
     owners = parse_map(contract_path().read_text(encoding="utf-8"))
+
+    if "--audit" in sys.argv[1:]:
+        missing = unnamed_modules(owners)
+        for rel in missing:
+            print(f"UNNAMED {rel}")
+        print()
+        print(
+            f"{len(missing)} tracked module(s) named in no design doc."
+            if missing
+            else "Every tracked module is named somewhere in docs/design/."
+        )
+        print(
+            "This is the check the drift report cannot do: it answers 'is this "
+            "documented at all', not 'did it change since the doc was touched'."
+        )
+        return
+
     reports = [drift(doc, paths) for doc, paths in sorted(owned_paths(owners).items())]
     flagged = [r for r in reports if r["added"] or r["removed"]]
 

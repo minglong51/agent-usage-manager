@@ -47,3 +47,12 @@ as context only. The pytest asserts the map is structurally sound; it deliberate
 **not** fail on drift, because a doc gate that blocks merges buys rubber-stamp edits,
 not maintained docs. A file *modified* to change its public API will not flag — boundary
 changes still need a human read.
+
+
+`python3 tests/test_design_docs.py --audit` answers a different question: which tracked modules
+are named in **no** design doc at all. The drift report only diffs forward from a doc's
+own last change, so staleness that predates an incomplete refresh is invisible to it
+permanently — paws described a `scene.js` renderer for three weeks after it became
+`wool.js`, and no number of drift runs could have said so. Run `--audit` when you inherit
+a doc you did not write. It skips tests, `__init__.py`, vendored code, type shims,
+generated migration revisions, and anything under a `-> none` path.
