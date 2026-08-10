@@ -735,6 +735,21 @@ def _restarts_in_window(label: str, now: float) -> int:
         return len(dq)
 
 
+def _last_death_in_window(label: str, now: float) -> Optional[float]:
+    """Newest death still inside the churn window, else None.
+
+    Read-only companion to _restarts_in_window (which owns pruning): the
+    dashboard shows "restarted 3m ago" from the same deque the count comes
+    from, separating a loop happening NOW from historical churn.
+    """
+    with _history_lock:
+        dq = _churn_deaths.get(label)
+        if not dq:
+            return None
+        last = dq[-1]
+        return last if now - last <= _CHURN_WINDOW_S else None
+
+
 # Alerting: a dashboard only helps while someone is looking at it (a real
 # crash loop once ran for 6 days unseen). When configured, a flag APPEARING
 # on a label runs the user's alert command. Fires on transitions only — an
@@ -962,6 +977,9 @@ class Agent(BaseModel):
     # Short-lived deaths under this label in the last 10 minutes (the count
     # behind a "churn" flag; informative even below the flag threshold).
     restarts: int = 0
+    # Epoch of the newest death in that window (None when there are none) —
+    # lets consumers say "restarted 3m ago", not just "churn ×3".
+    last_restart: Optional[float] = None
 
 
 def _collect() -> tuple[dict, dict, dict, dict]:
@@ -1129,6 +1147,7 @@ def list_agents() -> dict:
                 trend=trend,
                 flag=flag,
                 restarts=restarts,
+                last_restart=_last_death_in_window(label, now),
             )
         )
 

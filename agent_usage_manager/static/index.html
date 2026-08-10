@@ -258,7 +258,7 @@ function renderTree(key, tree) {
   if (tree) tb.firstElementChild.insertAdjacentHTML("afterend", childRows(tree));
 }
 
-function rowHTML(x, cpus) {
+function rowHTML(x, cpus, now) {
   const key = rowKey(x);
   const protectedNote = x.protected ? ' title="protected — cannot be killed"' : "";
   const kids = x.child_count > 0
@@ -278,7 +278,7 @@ function rowHTML(x, cpus) {
     : x.flag === "idle"
       ? ` <span class="flag idle" title="No CPU activity for 10+ minutes — wedged, or just waiting?">idle 10m+</span>`
       : x.flag === "churn"
-        ? ` <span class="flag churn" title="${x.restarts} short-lived restarts in the last 10 minutes — crash-looping under a supervisor?">churn ×${x.restarts}</span>`
+        ? ` <span class="flag churn" title="${x.restarts} short-lived restarts in the last 10 minutes — crash-looping under a supervisor?">churn ×${x.restarts}${x.last_restart?` · restarted ${dur(now-x.last_restart)} ago`:""}</span>`
         : x.flag === "leak"
           ? ` <span class="flag leak" title="Memory up ≥30% (and ≥128 MB) over 15 minutes without coming back down — leak?">leak?</span>`
           : "";
@@ -380,8 +380,8 @@ async function refresh() {
       bodies.set(key, tb);
       tbl.appendChild(tb);
     }
-    tb.firstElementChild ? tb.firstElementChild.outerHTML = rowHTML(x, cpus)
-                         : tb.innerHTML = rowHTML(x, cpus);
+    tb.firstElementChild ? tb.firstElementChild.outerHTML = rowHTML(x, cpus, data.ts)
+                         : tb.innerHTML = rowHTML(x, cpus, data.ts);
   }
   for (const [key, tb] of bodies) {
     if (!seen.has(key)) { tb.remove(); bodies.delete(key); expanded.delete(key); }

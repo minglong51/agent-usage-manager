@@ -116,6 +116,9 @@ alerts:                       # optional: shell command on badge appearance
   `_restarts_in_window(label, now)` counts deaths within
   `_CHURN_WINDOW_S = 600` s; ≥ `_CHURN_MIN_DEATHS = 3` forces
   `flag = "churn"`, outranking hot/idle (app.py:1009-1012).
+  `_last_death_in_window(label, now)` reads the newest in-window death
+  (read-only; `_restarts_in_window` owns pruning) for the `last_restart`
+  payload field.
 
 ### 2.2 Alerts (app.py:704-774)
 
@@ -185,7 +188,9 @@ Applies to every request:
   `None`), `stop_hint` (launchctl bootout command), `keepalive` (bool or
   `None` — whether the supervising job has KeepAlive, so consumers can word
   the supervision note precisely), `trend: list[float]`,
-  `flag: Optional[str]` in {hot, idle, churn, leak}, `restarts: int`.
+  `flag: Optional[str]` in {hot, idle, churn, leak}, `restarts: int`,
+  `last_restart: Optional[float]` (epoch of the newest in-window death —
+  the dashboard's "restarted 3m ago" on a churn badge).
 
 - `GET /api/tree/{pid}` → `agent_tree(pid) -> dict` (app.py:1118-1156). 404 if
   no such pid; 403 unless `_label_for(_match_target(proc))` hits (same target
