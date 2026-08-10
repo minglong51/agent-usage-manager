@@ -63,6 +63,16 @@ def test_load_config_bad_regex(tmp_path):
         m.load_config(cfg)
 
 
+def test_load_idle_ok(tmp_path):
+    cfg = tmp_path / "agents.yaml"
+    cfg.write_text("agents:\n  - label: x\n    match: x\nidle_ok:\n  - Admin\n  - coder\n")
+    assert m.load_idle_ok(cfg) == ["admin", "coder"]  # lowercased, like ignore:
+    cfg.write_text("agents:\n  - label: x\n    match: x\n")  # absent → every idle row badges
+    assert m.load_idle_ok(cfg) == []
+    cfg.write_text("agents: [broken")  # malformed → fail-soft like load_ignore
+    assert m.load_idle_ok(cfg) == []
+
+
 @pytest.fixture
 def client():
     # base_url matters: the browser guard rejects non-local Host headers, and
@@ -357,6 +367,24 @@ def test_alerts_fire_on_transition_with_cooldown(monkeypatch):
             for k in list(m._last_alert):
                 if k[0] == "bot":
                     m._last_alert.pop(k)
+
+
+def test_alert_message_is_verdict_first():
+    import agent_usage_manager.app as m
+
+    # The opening words are what a notification/feed card shows — the verdict,
+    # not the source tag; the full snapshot trails in brackets.
+    a = _agent("codex", "churn", restarts=4, cpu_percent=5.0, mem_mb=34.0, pid=1688)
+    msg = m._alert_message(a, "mini.local")
+    assert msg.startswith("Codex is crash-looping — 4 restarts in 10 min")
+    assert "[agent-usage-manager · churn · mini.local · cpu 5% · mem 34MB" in msg
+    assert "pid 1688" in msg and "restarts(10m) 4" in msg
+    assert "\n" not in msg  # AUM_MSG is a documented one-liner (passed to --title)
+    assert m._alert_message(_agent("bot", "hot", cpu_percent=190.0), "h").startswith(
+        "Bot is burning a core"
+    )
+    assert "gone quiet" in m._alert_message(_agent("bot", "idle"), "h")
+    assert "may be leaking" in m._alert_message(_agent("bot", "leak", mem_mb=2048.0), "h")
 
 
 def test_metrics_endpoint(client):

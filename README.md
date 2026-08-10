@@ -45,7 +45,9 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
 - **Trends, not just snapshots.** Each row has a CPU sparkline (last ~20 min, sampled
   in the background even with no browser open), plus a **`hot 5m+`** badge when an
   agent has been pegged ≥90% CPU for 5+ minutes, an **`idle 10m+`** badge when a
-  long-running agent has done nothing for 10+ minutes, and a **`churn ×N`** badge when
+  long-running agent has done nothing for 10+ minutes (suppressed for labels in
+  `idle_ok:` — for a fleet that waits for work, idle is the normal state and
+  badging it is wallpaper), and a **`churn ×N`** badge when
   the same agent has died young 3+ times in 10 minutes — the states worth investigating
   (runaway, possibly wedged, crash-looping under a supervisor). Churn is what hot/idle
   can't see: a crash-looping process is a fresh pid every poll, so no per-process
@@ -54,7 +56,9 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
 - **Alerts.** A dashboard only helps while you're looking at it. Add an `alerts:`
   block to `agents.yaml` and any badge appearing runs your command (desktop
   notification, Telegram bot, pager — anything) with the details in `$AUM_*` env
-  vars. Fires once per transition with a cooldown, never from the `list` CLI.
+  vars. `$AUM_MSG` leads with the plain-English verdict ("Codex is crash-looping —
+  4 restarts in 10 min"); the machine snapshot trails in brackets. Fires once per
+  transition with a cooldown, never from the `list` CLI.
   By default only `hot`/`churn`/`leak` alert — `idle` is the normal state of an
   agent fleet that waits for work, so it's opt-in.
 

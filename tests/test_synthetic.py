@@ -180,6 +180,53 @@ def test_leaker_flag_surfaces_in_api_row(monkeypatch):
         _cleanup_label("vllm", (pid,))
 
 
+def test_idle_badge_suppressed_for_waiting_class_label(monkeypatch):
+    now = time.time()
+    ct = now - 1200.0
+    pid = 93000
+    proc = FakeProc(pid, ["vllm", "serve"], ct=ct)
+    monkeypatch.setattr(m, "_cached", lambda key, ttl, fn: {})
+    monkeypatch.setattr(m, "_cpu_mem", lambda p, pm: (0.5, 60.0))
+    monkeypatch.setattr(m, "_collect", lambda: _fake_table([proc]))
+    try:
+        with m._history_lock:
+            # 20 min at 0.5% cpu — solidly inside the idle window
+            m._history[(pid, ct)] = _series(now, 1200, lambda t: (0.5, 60.0))
+        row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
+        assert row["flag"] == "idle"  # default: the badge shows
+        monkeypatch.setattr(m, "IDLE_OK", ["vll"])  # substring, like ignore:
+        row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
+        assert row["flag"] is None  # waiting-class label: no idle badge
+    finally:
+        _cleanup_label("vllm", (pid,))
+
+
+def test_supervised_row_exposes_keepalive(monkeypatch):
+    pid = 94000
+    proc = FakeProc(pid, ["ollama", "serve"], ct=time.time() - 30)
+
+    def fake_cached(key, ttl, fn):
+        if key == "launchd":
+            return {pid: "ai.test.ollama"}
+        if key.startswith("keepalive:"):
+            return fn()
+        return {}
+
+    monkeypatch.setattr(m, "_cached", fake_cached)
+    monkeypatch.setattr(m, "_cpu_mem", lambda p, pm: (1.0, 50.0))
+    monkeypatch.setattr(m, "_collect", lambda: _fake_table([proc]))
+    monkeypatch.setattr(m, "_keepalive", lambda label: True)
+    try:
+        row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
+        assert row["supervised"] == "ai.test.ollama"
+        assert row["keepalive"] is True
+        monkeypatch.setattr(m, "_keepalive", lambda label: False)
+        row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
+        assert row["keepalive"] is False  # RunAtLoad-only: a signal does stop it
+    finally:
+        _cleanup_label("ollama", (pid,))
+
+
 def test_signal_tree_refuses_on_create_time_mismatch(monkeypatch):
     root = FakeProc(70001, ["ollama", "serve"], ct=111.0)
     reused = FakeProc(70001, ["ollama", "serve"], ct=999.0)

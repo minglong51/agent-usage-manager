@@ -73,6 +73,18 @@ ignore:
 # their agents: label, so incidental tmux use never renames rows.
 tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
 
+# Labels whose idle state is NORMAL — agents that wait for work (bots parked
+# on a Telegram poll, gateways waiting for requests). They get no "idle"
+# badge: badging the whole waiting fleet wallpapers the dashboard and trains
+# badge-blindness (12 of 22 rows wore "idle 10m+" before this existed). Same
+# reasoning as `idle` being opt-in for alerts below. Case-insensitive
+# substrings of the row label (incl. tmux-derived ones), like ignore:.
+idle_ok:
+  - admin
+  - coder        # covers coder_1…coder_4
+  - hermes
+  - codex
+
 # GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).
 # On Apple Silicon there is no per-process GPU API, so the GPU column is blank.
 
@@ -98,9 +110,14 @@ tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
 # Badges stay live on the dashboard + machinery panel; the feed line rides the
 # next digest. Genuine breakage has louder, independent signals (mcp-autoheal
 # GAVE UP, cron-health, sync-bot liveness). `hot` dropped from alerting
-# entirely; notify.py is a `uv run` script, hence the inline PATH prefix.
+# entirely.
+# Ref discipline (2026-07-30): one stable ref per (agent, flag) + --upsert-open,
+# so a repeat firing UPDATES the single open card in place instead of stacking
+# one per cooldown expiry (nine churn cards in five days); the refreshed card
+# carries the latest cpu/mem/pid snapshot. fyi level = feed-only, riding the
+# digest exactly like the retired notify.py --feed-only wiring did.
 alerts:
-  command: 'PATH="$HOME/.local/bin:$PATH"; "$HOME/.claude/skills/_finance_lib/scripts/notify.py" --plain --priority digest --source usage-manager --feed-only --text "$AUM_MSG"'
+  command: '"$HOME/workspace/founder-agent-os/bin/attention" add --level fyi --source usage-manager --title "$AUM_MSG" --body "$AUM_MSG" --ref "usage-manager:$AUM_LABEL:$AUM_FLAG" --upsert-open'
   cooldown: 7200                 # 2 h per (agent, flag)
   flags: [churn, leak]
   leak_floor_mb: 1536            # bots legitimately ratchet RSS as session

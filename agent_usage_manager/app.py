@@ -197,10 +197,36 @@ def load_tmux_labels(path: Optional[Path] = None) -> Optional[re.Pattern]:
         return None
 
 
+def load_idle_ok(path: Optional[Path] = None) -> list[str]:
+    """Labels for which idle is the NORMAL state — no `idle` badge.
+
+        idle_ok: [admin, coder, hermes]   # substrings, case-insensitive
+
+    An agent that waits for work (a bot parked on a poll, a gateway waiting
+    for requests) spends its life idle, so badging every such row wallpapers
+    the dashboard and trains badge-blindness — the same reasoning that keeps
+    `idle` out of the default alert flags. Matched against the row label,
+    including tmux-derived instance labels, as a case-insensitive substring
+    (like `ignore:`), so `coder` covers coder_1…coder_4.
+
+    Best-effort like load_ignore(): absent or malformed means every idle row
+    badges, the documented default.
+    """
+    path = path or CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return [str(p).lower() for p in (data.get("idle_ok") or [])]
+
+
 MATCHERS, PROTECT = load_config()
 IGNORE = load_ignore()
 ALERTS = load_alerts()
 TMUX_LABELS = load_tmux_labels()
+IDLE_OK = load_idle_ok()
 SELF_PID = os.getpid()
 
 CONFIG_ERROR: Optional[str] = None
@@ -219,7 +245,7 @@ def _maybe_reload_config() -> None:
     it. The bad mtime is recorded so the file isn't re-parsed on every poll —
     only the next edit triggers another attempt.
     """
-    global MATCHERS, PROTECT, IGNORE, ALERTS, TMUX_LABELS, CONFIG_ERROR, _config_mtime
+    global MATCHERS, PROTECT, IGNORE, ALERTS, TMUX_LABELS, IDLE_OK, CONFIG_ERROR, _config_mtime
     try:
         mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
@@ -237,6 +263,7 @@ def _maybe_reload_config() -> None:
         IGNORE = load_ignore()
         ALERTS = load_alerts()
         TMUX_LABELS = load_tmux_labels()
+        IDLE_OK = load_idle_ok()
         CONFIG_ERROR = None
 
 
@@ -718,16 +745,36 @@ _prev_flag: dict[str, Optional[str]] = {}
 _last_alert: dict[tuple[str, str], float] = {}
 
 
+def _alert_message(a: "Agent", host: str) -> str:
+    """The AUM_MSG one-liner: plain-English verdict first, metadata trailing.
+
+    The opening words are what a notification/feed card shows first, so they
+    must say what's wrong — "Codex is crash-looping — 4 restarts in 10 min",
+    not "[agent-usage-manager] codex is churn on host: …". The bracketed tail
+    keeps the full machine-readable snapshot (alert commands pass AUM_MSG to
+    --title/-message verbatim, so it stays a single line).
+    """
+    verdict = {
+        "churn": f"is crash-looping — {a.restarts} restarts in 10 min",
+        "hot": f"is burning a core — cpu {a.cpu_percent:.0f}% for 5+ min (runaway?)",
+        "idle": "has gone quiet — no CPU activity for 10+ min (wedged, or just waiting?)",
+        "leak": f"may be leaking — mem {a.mem_mb:.0f}MB, up ≥30% over 15 min and not coming back down",
+    }.get(a.flag or "", f"is {a.flag}")
+    label = a.label[:1].upper() + a.label[1:]
+    return (
+        f"{label} {verdict} "
+        f"[agent-usage-manager · {a.flag} · {host or 'this host'} · "
+        f"cpu {a.cpu_percent:.0f}% · mem {a.mem_mb:.0f}MB · "
+        f"restarts(10m) {a.restarts} · pid {a.pid} · up {int(a.uptime_s)}s]"
+    )
+
+
 def _spawn_alert(command: str, a: "Agent", host: str) -> None:
     # Runtime data rides environment variables, never the shell string — the
     # command text itself comes only from the user's own config file.
     env = {
         **os.environ,
-        "AUM_MSG": (
-            f"[agent-usage-manager] {a.label} is {a.flag} on {host or 'this host'}: "
-            f"cpu {a.cpu_percent:.0f}%, mem {a.mem_mb:.0f}MB, "
-            f"restarts(10m) {a.restarts}, pid {a.pid}, up {int(a.uptime_s)}s"
-        ),
+        "AUM_MSG": _alert_message(a, host),
         "AUM_LABEL": a.label,
         "AUM_FLAG": a.flag or "",
         "AUM_PID": str(a.pid),
@@ -903,6 +950,11 @@ class Agent(BaseModel):
     # A signal won't stop it for good; `stop_hint` is the launchctl command that will.
     supervised: Optional[str] = None
     stop_hint: Optional[str] = None
+    # Whether the supervising launchd job has a KeepAlive policy (launchd
+    # respawns on exit — a signal genuinely won't stick) vs. only RunAtLoad
+    # (a signal works now; it comes back at next login). Lets consumers word
+    # the supervision note precisely instead of over-claiming for every row.
+    keepalive: Optional[bool] = None
     # Recent CPU samples (sparkline) and the sustained-state flag
     # ("hot"/"idle"/"churn"/"leak").
     trend: list[float] = []
@@ -1046,6 +1098,10 @@ def list_agents() -> dict:
             # Churn outranks hot/idle: a respawning process can't accrue
             # either window, and the loop itself is the urgent signal.
             flag = "churn"
+        if flag == "idle" and any(p in label.lower() for p in IDLE_OK):
+            # Waiting-class label (agents.yaml `idle_ok:`): idle is its NORMAL
+            # state, so the badge is wallpaper, not signal.
+            flag = None
         agents.append(
             Agent(
                 pid=root,
@@ -1065,6 +1121,11 @@ def list_agents() -> dict:
                 ),
                 supervised=jobs.get(root),
                 stop_hint=_stop_hint(jobs[root]) if root in jobs else None,
+                keepalive=(
+                    _cached(f"keepalive:{jobs[root]}", 60.0, lambda: _keepalive(jobs[root]))
+                    if root in jobs
+                    else None
+                ),
                 trend=trend,
                 flag=flag,
                 restarts=restarts,

@@ -21,12 +21,13 @@ in the threadpool).
   config is a startup failure.
 - `load_ignore(path) -> list[str]` (app.py:90-107), `load_alerts(path) ->
   Optional[dict]` (app.py:110-161), `load_tmux_labels(path) ->
-  Optional[re.Pattern]` (app.py:164-195) — best-effort loaders: any error means
+  Optional[re.Pattern]` (app.py:164-195), `load_idle_ok(path) -> list[str]`
+  (app.py:200-221) — best-effort loaders: any error means
   "feature off", never a crash (config validity was already gated by
   `load_config`).
 - `_maybe_reload_config()` (app.py:212-238) — called at the top of
   `list_agents()` and `kill_agent()`; compares `CONFIG_PATH` mtime under
-  `_config_lock`, re-runs all four loaders on change. A parse error keeps the
+  `_config_lock`, re-runs all five loaders on change. A parse error keeps the
   last good config and sets `CONFIG_ERROR` (surfaced in the API/header); the
   bad mtime is recorded so the file isn't re-parsed every poll.
 
@@ -40,6 +41,7 @@ agents:                       # required: the allowlist (list AND killability)
 protect: [uvicorn, ...]       # matched + listed, kill refused (substring, lowercased)
 ignore: [crashpad, ...]       # never an agent: not listed, not killable
 tmux_labels: "^bot-(.+)$"     # optional: per-instance label from tmux session name
+idle_ok: [admin, ...]         # optional: labels whose idle is NORMAL — no idle badge
 alerts:                       # optional: shell command on badge appearance
   command: '...$AUM_MSG...'   # run via shell; data rides $AUM_* env vars only
   cooldown: 600               # seconds per (label, flag) pair; default 600
@@ -79,10 +81,13 @@ alerts:                       # optional: shell command on badge appearance
   `nvidia-smi --query-compute-apps`, MiB per pid), `_launchd_jobs()`
   (app.py:459, `launchctl list` → pid→label, user domain only),
   `_tmux_panes()` (app.py:502, `tmux list-panes -a` → pane pid→session name).
-  All 2s TTL, 4s subprocess timeout, empty on any failure.
+  All 2s TTL, 4s subprocess timeout, empty on any failure — except the
+  per-label `keepalive:<label>` entries behind the Agent payload field, which
+  cache `_keepalive()` for 60s (a job's KeepAlive policy is plist-static).
 - `_keepalive(label) -> bool` (app.py:437-456) — `launchctl print
   gui/$UID/<label>` grep for KeepAlive; False on any error (milder wording,
-  never over-claims).
+  never over-claims). Backs the supervised-row `keepalive` payload field and
+  the 409 wording on the kill path.
 - `_instance_label(root, base, meta, panes) -> str` (app.py:527-547) — walk
   root + ancestors for the nearest tmux pane; if its session matches
   `tmux_labels:`, the first capture group becomes the row label (whole match if
@@ -125,6 +130,11 @@ alerts:                       # optional: shell command on badge appearance
   shell=True, start_new_session=True)`, output devnulled, errors swallowed.
   Runtime data goes **only** through env vars: `AUM_MSG`, `AUM_LABEL`,
   `AUM_FLAG`, `AUM_PID`, `AUM_CPU`, `AUM_MEM_MB`, `AUM_RESTARTS`, `AUM_HOST`.
+  `AUM_MSG` (`_alert_message`) leads with the plain-English verdict — the
+  opening words are what a notification shows — and trails the machine
+  snapshot in brackets: "Codex is crash-looping — 4 restarts in 10 min
+  [agent-usage-manager · churn · host · cpu 5% · …]"; one line, since alert
+  commands pass it to `--title`/`-message` verbatim.
 - Server-mode gate: alerts run only when `_sampler_started` is set
   (app.py:1055-1056) — the one-shot `list` CLI never alerts.
 
@@ -151,7 +161,9 @@ Applies to every request:
 - `GET /api/agents` → `list_agents() -> dict` (app.py:957-1073). Main path:
   reload config → cached gpu/launchd/tmux maps → `_collect()` → compute roots
   → per root: sum tree cpu/mem/gpu, derive instance label, append history,
-  `_trend_and_flag`, churn override → prune dead handles/history (recording
+  `_trend_and_flag`, churn override, `idle_ok:` suppression (an `idle` flag on
+  a waiting-class label is dropped — idle is that label's NORMAL state, so the
+  badge would be wallpaper) → prune dead handles/history (recording
   deaths) → sort by CPU desc → maybe `_check_alerts`. Response shape:
 
   ```json
@@ -170,7 +182,9 @@ Applies to every request:
   `cmdline` (redacted, truncated to 300), `status`, `alive` (not zombie),
   `cpu_percent`/`mem_mb`/`gpu_mem_mb` (tree totals; gpu `None` when no data),
   `uptime_s`, `child_count`, `protected`, `supervised` (launchd label or
-  `None`), `stop_hint` (launchctl bootout command), `trend: list[float]`,
+  `None`), `stop_hint` (launchctl bootout command), `keepalive` (bool or
+  `None` — whether the supervising job has KeepAlive, so consumers can word
+  the supervision note precisely), `trend: list[float]`,
   `flag: Optional[str]` in {hot, idle, churn, leak}, `restarts: int`.
 
 - `GET /api/tree/{pid}` → `agent_tree(pid) -> dict` (app.py:1118-1156). 404 if
@@ -259,25 +273,34 @@ Single inline `<script>` (index.html:104-353), no framework.
   the table is kept but dimmed with a stale banner (`body.stale`,
   index.html:285-293) — never blank data someone might kill from. Skips
   re-render while text is selected (copying a launchctl hint).
-- **Keyed rendering:** one `<tbody>` per agent pid (`bodies` Map); rows are
-  rewritten in place, tbodys sorted by label but **only reordered when the
-  pointer is off the table** (`overTable`, index.html:117-120, 342-346) so
-  the kill button can't shift under the cursor.
+- **Keyed rendering:** one `<tbody>` per agent, keyed by `pid:create_time`
+  (`rowKey`; the `bodies`/`expanded` maps) so a recycled pid can't inherit
+  another agent's row; rows are rewritten in place, tbodys sorted
+  flagged-first (hot/churn/leak/idle, then the server's CPU-desc order within
+  a group) but **only reordered when the pointer is off the table**
+  (`overTable`, index.html:117-120, 342-346) so the kill button can't shift
+  under the cursor. The header carries the flag counts (`1 hot · 4 idle`).
 - **Kill flow:** `kill(pid, force, children)` (index.html:169-192) —
   `confirm()` with the child count → `killToken()` (index.html:158-167:
   localStorage, `prompt()` on first use pointing at `token_path` from the API)
   → `POST /api/kill/{pid}` with `X-Kill-Token`. A 403 mentioning the token
-  clears localStorage so the next click re-prompts (rotation-aware).
+  clears localStorage so the next click re-prompts (rotation-aware). Both the
+  ✓ and ✗ result lines auto-clear on a `setTimeout` (longer for the ✗
+  partial-failure, which needs reading time) so no outcome sticks forever.
 - **Tree expansion:** `toggleTree`/`loadTree`/`renderTree`
   (index.html:213-232) fetch `/api/tree/{pid}` and insert indented child rows;
   expanded subtrees are re-fetched on every refresh (index.html:348).
 - **Rendering details:** `esc()` HTML-escapes all host data (injection into a
   page with a kill endpoint is a real risk, index.html:122-128); `spark()`
   draws the SVG sparkline; badges hot/idle/churn/leak with explanatory
-  tooltips (index.html:242-250); supervised rows swap kill buttons for a
+  tooltips (index.html:242-250; the launchd badge's tooltip follows the
+  payload's `keepalive` — "won't stick" only for KeepAlive jobs); supervised
+  rows swap kill buttons for a
   click-to-copy `launchctl bootout` hint; GPU column hidden when nothing
   reports GPU (`body.hide-gpu`); protected rows get disabled buttons (the
-  server refuses regardless).
+  server refuses regardless). At ≤700px rows stack (agent+badges / cpu·mem /
+  actions), the sparkline hides, and the column headers drop, so the
+  kill verb is on-screen at phone width.
 
 ## 7. Error handling conventions
 

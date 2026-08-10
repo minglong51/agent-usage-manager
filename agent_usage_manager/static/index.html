@@ -77,6 +77,20 @@
     /* visually truncate the launchctl hint; click-to-copy still copies the full text */
     code.hint { display: inline-block; max-width: 110px; overflow: hidden;
                 text-overflow: ellipsis; vertical-align: middle; }
+    /* The flat table measures ~554px, so at 375px the kill verb sits off-screen.
+       Stack each row instead — agent+badges / cpu·mem / actions — with column
+       headers gone (they no longer map to anything) and the sparkline hidden
+       (a 64px block element would shove cpu/mem further down the stack). */
+    thead { display: none; }
+    tbody, tr, td { display: block; }
+    tr { padding: 8px 10px; border-bottom: 1px solid #161b22; }
+    td { border: 0; padding: 1px 0; white-space: normal; }
+    td:empty { display: none; }
+    /* :not(.c-up) — the uptime cell is .num too, and this rule must not
+       resurrect it past the .c-up hide above. */
+    td.num:not(.c-up) { display: inline-block; text-align: left; margin-right: 16px; }
+    body.hide-gpu .gpu { display: none; }  /* re-assert past the td.num rule above */
+    .spark { display: none; }
   }
 </style>
 </head>
@@ -111,8 +125,12 @@ const empty = document.getElementById("empty");
 const stale = document.getElementById("stale");
 let lastOk = null;          // timestamp of the last successful /api/agents fetch
 let tokenPath = "";         // where the kill token lives on disk (from /api/agents)
-const expanded = new Set(); // pids whose process subtree is unfolded
-const bodies = new Map();   // pid -> its <tbody> (one tbody per agent: row + children)
+// A row's identity is pid + create_time: pids get reused, so keying the DOM by
+// pid alone can fold two different agents into one <tbody> (the server pairs
+// them for the same reason — see Agent.create_time).
+const rowKey = x => x.pid + ":" + x.create_time;
+const expanded = new Map(); // row key -> pid, for rows whose subtree is unfolded
+const bodies = new Map();   // row key -> its <tbody> (one tbody per agent: row + children)
 
 // Reordering rows under the pointer relocates the kill button mid-aim — freeze
 // the ORDER (not the data) while the pointer is over the table.
@@ -190,8 +208,11 @@ async function kill(pid, force, children) {
       errEl.textContent = `✓ ${j.result} (${j.killed} process${j.killed===1?"":"es"})`;
       setTimeout(() => { errEl.textContent = ""; errEl.className = "meta"; }, 4000);
     } else {
+      // partial failure — same auto-clear as the ✓ path, with a longer dwell
+      // (an error needs more reading time), so it can't stick around forever.
       errEl.className = "meta err";
       errEl.textContent = `✗ ${j.result} — ${j.killed} killed, ${j.still_running} still running`;
+      setTimeout(() => { errEl.textContent = ""; errEl.className = "meta"; }, 8000);
     }
     await refresh();
   } catch (e) { errEl.className = "meta err"; errEl.textContent = "kill failed: " + e.message; }
@@ -216,34 +237,41 @@ function childRows(tree) {
   </tr>`).join("");
 }
 
-async function toggleTree(pid) {
-  if (expanded.has(pid)) { expanded.delete(pid); renderTree(pid, null); return; }
-  expanded.add(pid);
-  await loadTree(pid);
+async function toggleTree(pid, key) {
+  if (expanded.has(key)) { expanded.delete(key); renderTree(key, null); return; }
+  expanded.set(key, pid);
+  await loadTree(pid, key);
 }
 
-async function loadTree(pid) {
+async function loadTree(pid, key) {
   try {
     const r = await fetch(`/api/tree/${pid}`);
     if (!r.ok) throw new Error("HTTP " + r.status);
-    renderTree(pid, (await r.json()).tree);
-  } catch (e) { expanded.delete(pid); }
+    renderTree(key, (await r.json()).tree);
+  } catch (e) { expanded.delete(key); }
 }
 
-function renderTree(pid, tree) {
-  const tb = bodies.get(pid);
+function renderTree(key, tree) {
+  const tb = bodies.get(key);
   if (!tb) return;
   tb.querySelectorAll("tr.child").forEach(tr => tr.remove());
   if (tree) tb.firstElementChild.insertAdjacentHTML("afterend", childRows(tree));
 }
 
 function rowHTML(x, cpus) {
+  const key = rowKey(x);
   const protectedNote = x.protected ? ' title="protected — cannot be killed"' : "";
   const kids = x.child_count > 0
-    ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU are tree totals; kill stops the whole tree. Click to ${expanded.has(x.pid) ? "collapse" : "expand"}." onclick="toggleTree(${x.pid})">${expanded.has(x.pid) ? "−" : "+"}${x.child_count}</span>`
+    ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU are tree totals; kill stops the whole tree. Click to ${expanded.has(key) ? "collapse" : "expand"}." onclick="toggleTree(${x.pid}, '${key}')">${expanded.has(key) ? "−" : "+"}${x.child_count}</span>`
     : "";
+  // Word the supervision note the way the server does on the kill path: only a
+  // KeepAlive job truly can't be stopped by a signal — a RunAtLoad-only job
+  // dies fine, it just comes back at next login. Never over-claim.
+  const svcWhy = x.keepalive
+    ? "A signal won't stick — launchd respawns it (KeepAlive)."
+    : "A signal stops it now but launchd restarts it at next login (RunAtLoad).";
   const svc = x.supervised
-    ? ` <span class="svc" title="Supervised by launchd (job '${esc(x.supervised)}'). A signal won't stop it — launchd respawns it. Use the launchctl command on the right.">launchd</span>`
+    ? ` <span class="svc" title="Supervised by launchd (job '${esc(x.supervised)}'). ${svcWhy} Use the launchctl command on the right.">launchd</span>`
     : "";
   const flag = x.flag === "hot"
     ? ` <span class="flag hot" title="CPU pegged ≥90% of a core for 5+ minutes — runaway?">hot 5m+</span>`
@@ -254,8 +282,9 @@ function rowHTML(x, cpus) {
         : x.flag === "leak"
           ? ` <span class="flag leak" title="Memory up ≥30% (and ≥128 MB) over 15 minutes without coming back down — leak?">leak?</span>`
           : "";
-  // launchd-supervised jobs can't be stopped by a signal; show the real
-  // command (click to copy) instead of dead-end kill buttons.
+  // launchd-supervised jobs are stopped via launchctl, not a signal (a
+  // KeepAlive job would just respawn); show the real command (click to copy)
+  // instead of dead-end kill buttons.
   const actions = x.supervised
     ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${esc(x.stop_hint)}</code>`
     : `<button class="kill" ${x.protected?'disabled':''}${protectedNote}
@@ -308,9 +337,16 @@ async function refresh() {
     ? ` · Σ ${totCpu.toFixed(0)}% cpu, ${(totMem/1024).toFixed(1)} GB`
     : "";
   const ram = data.mem_total_mb
-    ? ` · ram ${(data.mem_total_mb * data.mem_used_pct / 100 / 1024).toFixed(0)}/${(data.mem_total_mb/1024).toFixed(0)} GB`
+    ? ` · ram ${data.mem_used_pct.toFixed(0)}%`
     : "";
-  meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus${ram} · ${a.length} agents${load} · ${new Date(data.ts*1000).toLocaleTimeString()}`;
+  // The 2-second "what's wrong": flag counts right in the header stats.
+  const nFlag = {};
+  for (const x of a) if (x.flag) nFlag[x.flag] = (nFlag[x.flag] || 0) + 1;
+  const flagSum = ["hot", "churn", "leak", "idle"]
+    .filter(f => nFlag[f])
+    .map(f => `${nFlag[f]} ${f}`)
+    .join(" · ");
+  meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus${ram} · ${a.length} agents${load}${flagSum ? " · " + flagSum : ""} · ${new Date(data.ts*1000).toLocaleTimeString()}`;
   document.title = a.length
     ? `${a.length} agent${a.length===1?"":"s"} · ${totCpu.toFixed(0)}% cpu`
     : "agent usage manager";
@@ -329,29 +365,34 @@ async function refresh() {
   // Keyed update: one <tbody> per agent. Rewriting a row in place keeps its
   // geometry stable; tbodys are only MOVED (reordered) when the pointer is
   // away from the table, so a kill button never shifts under the cursor.
-  a.sort((p, q) => p.label === q.label ? p.pid - q.pid : (p.label < q.label ? -1 : 1));
+  // Flagged rows first (hot/churn before the quiet fleet) so "what's wrong" is
+  // the top of the page; within a group the stable sort keeps the server's
+  // CPU-desc order.
+  const flagRank = {hot: 0, churn: 1, leak: 2, idle: 3};
+  a.sort((p, q) => (flagRank[p.flag] ?? 4) - (flagRank[q.flag] ?? 4));
   const seen = new Set();
   for (const x of a) {
-    seen.add(x.pid);
-    let tb = bodies.get(x.pid);
+    const key = rowKey(x);
+    seen.add(key);
+    let tb = bodies.get(key);
     if (!tb) {
       tb = document.createElement("tbody");
-      bodies.set(x.pid, tb);
+      bodies.set(key, tb);
       tbl.appendChild(tb);
     }
     tb.firstElementChild ? tb.firstElementChild.outerHTML = rowHTML(x, cpus)
                          : tb.innerHTML = rowHTML(x, cpus);
   }
-  for (const [pid, tb] of bodies) {
-    if (!seen.has(pid)) { tb.remove(); bodies.delete(pid); expanded.delete(pid); }
+  for (const [key, tb] of bodies) {
+    if (!seen.has(key)) { tb.remove(); bodies.delete(key); expanded.delete(key); }
   }
   if (!overTable) {
-    const order = a.map(x => bodies.get(x.pid));
+    const order = a.map(x => bodies.get(rowKey(x)));
     const current = [...tbl.querySelectorAll("tbody")];
     if (order.some((tb, i) => tb !== current[i])) order.forEach(tb => tbl.appendChild(tb));
   }
   // refresh unfolded subtrees so child cpu/mem stay live
-  for (const pid of expanded) if (seen.has(pid)) loadTree(pid);
+  for (const [key, pid] of expanded) if (seen.has(key)) loadTree(pid, key);
 }
 
 refresh();
