@@ -30,6 +30,17 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
 > run on Apple Silicon, where per-process GPU stats aren't available so that column
 > is hidden. The UI auto-refreshes every 3s.
 
+## Quick start
+
+```bash
+uvx agent-usage-manager      # then open http://127.0.0.1:8765 (opens automatically)
+```
+
+One command — no install, no virtualenv, no leftovers. Other install options,
+config, and flags: [Install & run](#install--run).
+
+![one command to a live dashboard](docs/demo.gif)
+
 ## What it does
 
 - **One row per agent.** Agents are grouped by process tree — the spawned children
@@ -88,6 +99,17 @@ ollama         50122  ● running     3.1    9210    14080     6h 02m  ollama ru
   while your pointer is over the table, so the kill button can't shift under your
   cursor mid-click.
 
+## Why not just htop / Grafana?
+
+- **htop sees processes, not agents.** No rollup of a spawned tree under the
+  agent that owns it, no agent states (crash-looping, idle, leaking), and an
+  unguarded `F9`.
+- **Grafana + Prometheus + an exporter is a stack you operate.** This is one
+  command with no database — and it still serves `/metrics` if you want both.
+- **The kill switch is the point.** Allowlist-matched, token-gated, guarded
+  against CSRF and DNS rebinding, with an append-only action log — a web page
+  that can stop processes needs exactly those.
+
 ## Product boundary
 
 `agent-usage-manager` is intentionally **not** a fleet scheduler, dispatcher, or
@@ -143,6 +165,13 @@ This is the important part — a web page that can kill processes needs guardrai
   also pass `--unsafe-expose`. Exposing the port means one static token is all
   that stands between the network and your agents — put real auth in front
   (reverse proxy + basic auth, SSH tunnel, etc.) before using that flag.
+- **A proxy voids the loopback guarantee.** The production deployment (Ming's
+  suite) fronts this loopback bind with `tailscale serve` (`:8448 → 127.0.0.1:8765`),
+  so the tailnet reaches the UI despite the loopback bind: reads like
+  `/api/agents` are open there, and the static token is the *only* boundary on
+  actions. That is deliberate (owner-only tailnet + token-gated actions), but do
+  not read "loopback-only" as "not network-reachable" — a proxy in front is not
+  a trust boundary.
 
 ## Limits & known issues
 
@@ -174,7 +203,7 @@ This is the important part — a web page that can kill processes needs guardrai
 - **Windows is untested.** Kill maps to `TerminateProcess` via psutil and may
   work, but CI covers Linux + macOS only.
 
-## Quick start
+## Install & run
 
 **Recommended — one command, nothing to install first:**
 
