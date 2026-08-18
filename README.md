@@ -453,7 +453,7 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 ## Stay in the loop
 
 New tools and field notes on running AI agents with discipline go to the
-[Agent Discipline](https://buttondown.email/minglong51) list first — launch
+[Agent Discipline](https://buttondown.com/minglong51) list first — launch
 notes, operational patterns, early access. A few emails a month at most.
 
 ## License
