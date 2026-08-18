@@ -450,6 +450,12 @@ SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
   closed; add `--unsafe-expose` only with auth in front (see
   [Safety](#safety)).
 
+## Stay in the loop
+
+New tools and field notes on running AI agents with discipline go to the
+[Agent Discipline](https://buttondown.email/minglong51) list first — launch
+notes, operational patterns, early access. A few emails a month at most.
+
 ## License
 
 MIT
