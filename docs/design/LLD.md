@@ -262,7 +262,10 @@ Applies to every request:
 - `_bind_allowed(host, unsafe_expose) -> bool` (cli.py:10-25) — True for
   `localhost`, loopback IPs, or when `--unsafe-expose` was passed; anything
   else is a `parser.error` at startup (fail closed — the kill endpoint must
-  not reach a network on a casual flag).
+  not reach a network on a casual flag). Deployment caveat (2026-08-14): the
+  production host fronts the loopback bind with `tailscale serve` (:8448), so
+  the tailnet reaches the UI despite this check — a proxy in front is not a
+  trust boundary, and the static kill token is the real boundary there.
 - `_run_list(as_json)` (cli.py:40-76) — lazily imports `app` (no uvicorn
   import, no sampler thread, so no alerts), calls `list_agents()` twice with a
   0.5s gap (first `cpu_percent` read is always 0.0), prints raw JSON or an

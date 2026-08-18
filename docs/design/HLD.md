@@ -72,7 +72,9 @@ each probed with `shutil.which` and degrading to empty results when absent:
 - **Install/run paths:** `uvx agent-usage-manager` (recommended, README.md:169),
   `pipx`/`pip install agent-usage-manager`, or `./run.sh` from a clone. Binds
   `127.0.0.1:8765` by default and refuses non-loopback hosts without
-  `--unsafe-expose` (cli.py:117-122).
+  `--unsafe-expose` (cli.py:117-122). On Ming's host a `tailscale serve` proxy
+  (:8448) fronts that loopback bind — tailnet-reachable by design, token-gated
+  for actions; the loopback refusal covers direct binds only (2026-08-14 note).
 - **As a service:** README.md:318-333 documents a systemd user unit; on this
   host it runs under launchd, and the bundled `agents.yaml:93-99` wires alerts
   into the fleet's Telegram notifier.
