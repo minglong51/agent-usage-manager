@@ -69,9 +69,13 @@ config, and flags: [Install & run](#install--run).
   notification, Telegram bot, pager — anything) with the details in `$AUM_*` env
   vars. `$AUM_MSG` leads with the plain-English verdict ("Codex is crash-looping —
   4 restarts in 10 min"); the machine snapshot trails in brackets. Fires once per
-  transition with a cooldown, never from the `list` CLI.
+  transition with a cooldown, never from the `list` CLI, and the cooldown is only
+  charged when the command exits 0 (a broken notifier doesn't suppress the retry).
   By default only `hot`/`churn`/`leak` alert — `idle` is the normal state of an
   agent fleet that waits for work, so it's opt-in.
+  Run `agent-usage-manager test-alert` once after wiring it up: it fires the
+  configured command synchronously with a test message and reports the exit
+  status, so a broken channel surfaces today instead of during the next incident.
 
   ```yaml
   alerts:
@@ -94,7 +98,10 @@ config, and flags: [Install & run](#install--run).
 - **Config hot-reload.** Edits to `agents.yaml` apply on the next poll, no restart.
   A broken edit keeps the last good config and shows the parse error in the header.
 - **`list` subcommand.** `agent-usage-manager list` (or `list --json`) prints a one-shot
-  table to stdout — no server, good for scripts and cron checks.
+  table to stdout — no server, good for scripts and cron checks. One-shot mode has no
+  history, so the sustained-state flags (`hot`/`idle`/`churn`/`leak`) can never populate
+  there (`--json` says `"flags_available": false`); query the running server's
+  `/api/agents` when you need flags.
 - **Kill-safe table.** Rows keep a stable order (sorted by label) and never reorder
   while your pointer is over the table, so the kill button can't shift under your
   cursor mid-click.
@@ -295,6 +302,19 @@ and `/metrics` series all use the derived label, so each instance gets its own
 state. Sessions that don't match the regex keep their `agents:` label, and the
 key is ignored where tmux isn't installed or running.
 
+**Supervised fleets (`launchd_labels:`, macOS)** — the same problem for agents
+that run as launchd jobs and never touch tmux (five `hermes` LaunchAgents all
+landing as "hermes"). The launchd job label is their durable identity:
+
+```yaml
+launchd_labels: "^ai\\.hermes\\.(?:gateway-)?(.+)$"   # ai.hermes.gateway-frontdoor → frontdoor
+```
+
+When a matched root's own launchd job label matches, the first capture group
+(the whole label if there's no group) becomes the row label — with the same
+per-instance churn/alert/metrics identity as `tmux_labels:`. `tmux_labels`
+wins when both apply; roots with no matching job keep their `agents:` label.
+
 **Which `agents.yaml` is used** — resolved once at startup, first hit wins:
 
 1. `AGENTS_CONFIG=/path/to/agents.yaml` env var (the `--config` flag sets this)
@@ -363,7 +383,7 @@ Linux (systemd), `~/.config/systemd/user/agent-usage-manager.service`:
 [Unit]
 Description=agent usage manager
 [Service]
-ExecStart=%h/agent-usage-manager/.venv/bin/uvicorn app:app --port 8765
+ExecStart=%h/agent-usage-manager/.venv/bin/uvicorn agent_usage_manager.app:app --port 8765
 WorkingDirectory=%h/agent-usage-manager
 Restart=on-failure
 [Install]
@@ -387,6 +407,35 @@ Cross-platform note: kill uses psutil's `terminate()`/`kill()`, which map to
 SIGTERM/SIGKILL on POSIX and TerminateProcess on Windows.
 
 ## Release notes
+
+### 0.2.5 — per-instance labels for supervised fleets + the honesty batch
+
+- `launchd_labels:` config — per-instance row labels from launchd job labels,
+  mirroring `tmux_labels:`. A supervised fleet (several LaunchAgents on one
+  binary) no longer collapses into one blurred label for churn tracking, alert
+  transitions, and `/metrics`. `idle_ok:` suppression matches the base matcher
+  label as well, so a renamed instance (`hermes` → `frontdoor`) keeps its
+  class-level suppression.
+- New `test-alert` subcommand: fires the configured `alerts.command` once,
+  synchronously, and reports the exit status — proves the alert channel before
+  an incident depends on it.
+- `ignore:` now covers ChatGPT.app's embedded Codex helpers (renderer/service
+  processes, `Resources/codex` app-server) and the `Codex Computer Use`
+  desktop-automation app — they matched the `codex` pattern via the bundle
+  name and cluttered the dashboard with GUI plumbing.
+- Config deletion is no longer silent: a vanished `agents.yaml` surfaces as a
+  `config_error` ("running on the last good config") instead of looking like
+  hot-reload still works.
+- The kill confirm now names the agent (label + command line, not just PID)
+  and discloses that plain kill escalates SIGTERM → SIGKILL after 3s.
+- The first-kill token prompt names the server's host (and the ssh one-liner)
+  for browsers viewing the dashboard over a tunnel.
+- The DNS-rebinding 403 now names the remedy (use a loopback name or bare IP).
+- `list` says so when flag fields can't populate (one-shot mode has no
+  history): a stderr note, and `"flags_available": false` in `--json`.
+- `--host ::1` now produces a valid bracketed IPv6 URL for the browser open.
+- Fixed the README's systemd unit (`uvicorn app:app` could never resolve the
+  module; it's `agent_usage_manager.app:app`).
 
 ### 0.2.4 — stop reporting non-agents
 

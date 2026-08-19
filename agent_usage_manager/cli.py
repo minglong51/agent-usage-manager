@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import os
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -69,6 +70,11 @@ def _run_list(as_json: bool) -> None:
     data = m.list_agents()
 
     if as_json:
+        # Flags need 5–15 minutes of in-process history; a one-shot process
+        # can never populate them. Say so in the payload — a cron check on
+        # `flag` from this output would silently never fire otherwise.
+        # Query the running server's /api/agents if you need flags.
+        data["flags_available"] = False
         print(json.dumps(data, indent=2))
         return
 
@@ -93,6 +99,69 @@ def _run_list(as_json: bool) -> None:
     widths = [max(len(head[i]), *(len(r[i]) for r in rows)) for i in range(len(head))]
     for r in [head] + rows:
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+    print(
+        "note: FLAG is always empty in one-shot mode — hot/idle/churn/leak need "
+        "5–15 min of history from the running server (see its /api/agents).",
+        file=sys.stderr,
+    )
+
+
+def _run_test_alert() -> int:
+    """Fire the configured alert command once, synchronously, and report back.
+
+    The alert path only proves itself when a real badge appears — the worst
+    moment to learn the command is broken (a PATH that drifted, a notifier
+    that moved). This runs the exact `alerts.command` from the resolved
+    agents.yaml with the same $AUM_* env contract and a synthetic "test"
+    message, waits for it, and says whether delivery succeeded. No cooldown
+    or transition state is touched.
+    """
+    import subprocess
+
+    from agent_usage_manager import app as m
+
+    cfg = m.ALERTS
+    if not cfg:
+        print(
+            f"no alerts.command configured in {m.CONFIG_PATH} — nothing to test",
+            file=sys.stderr,
+        )
+        return 2
+    host = socket.gethostname()
+    msg = (
+        f"Test alert — agent-usage-manager alert wiring works "
+        f"[agent-usage-manager · test · {host} · sent by `test-alert`]"
+    )
+    env = {
+        **os.environ,
+        "AUM_MSG": msg,
+        "AUM_LABEL": "test",
+        "AUM_FLAG": "test",
+        "AUM_PID": str(os.getpid()),
+        "AUM_CPU": "0.0",
+        "AUM_MEM_MB": "0",
+        "AUM_RESTARTS": "0",
+        "AUM_HOST": host,
+    }
+    print(f"config:  {m.CONFIG_PATH}")
+    print(f"command: {cfg['command']}")
+    print(f"message: {msg}")
+    try:
+        proc = subprocess.run(
+            cfg["command"], shell=True, env=env,
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"FAILED to run: {e}", file=sys.stderr)
+        return 1
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()[:500]
+        print(f"FAILED: exit {proc.returncode}" + (f" — {err}" if err else ""),
+              file=sys.stderr)
+        return 1
+    print("OK — command exited 0. If nothing showed up, the command's own "
+          "delivery path is the thing to check.")
+    return 0
 
 
 def main() -> None:
@@ -124,7 +193,19 @@ def main() -> None:
         "list", help="One-shot agent listing to stdout (no server) — for scripts and cron."
     )
     listp.add_argument("--json", action="store_true", help="Emit the raw API JSON.")
-    listp.add_argument("--config", dest="config", default=None, help=argparse.SUPPRESS)
+    # default=SUPPRESS: a subparser default would otherwise CLOBBER a top-level
+    # `--config X` given before the subcommand (argparse applies subparser
+    # defaults over the existing namespace) — the config would silently fall
+    # back to cwd/bundled. SUPPRESS means "only set when actually given here".
+    listp.add_argument("--config", dest="config", default=argparse.SUPPRESS,
+                       help=argparse.SUPPRESS)
+    tap = sub.add_parser(
+        "test-alert",
+        help="Fire the configured alerts.command once and report whether it "
+        "succeeded — proves the alert channel before a real badge depends on it.",
+    )
+    tap.add_argument("--config", dest="config", default=argparse.SUPPRESS,
+                     help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.config:
         os.environ["AGENTS_CONFIG"] = args.config
@@ -132,6 +213,8 @@ def main() -> None:
     if args.cmd == "list":
         _run_list(args.json)
         return
+    if args.cmd == "test-alert":
+        sys.exit(_run_test_alert())
 
     if not _bind_allowed(args.host, args.unsafe_expose):
         parser.error(
@@ -143,7 +226,9 @@ def main() -> None:
     import uvicorn
 
     open_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
-    url = f"http://{open_host}:{args.port}"
+    # Bracket IPv6 literals — "http://::1:8765" is not a URL a browser can parse.
+    url_host = f"[{open_host}]" if ":" in open_host else open_host
+    url = f"http://{url_host}:{args.port}"
     print(f"agent-usage-manager → {url}")
 
     if not args.no_browser:

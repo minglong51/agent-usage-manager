@@ -61,6 +61,20 @@ ignore:
   - updater       # Sparkle's Updater.app; argv[1] is the app path, so it matches
   - for chrome    # "Codex for Chrome" extension host, not the agent
   - tmux attach   # tmux clients: `attach -t <session>` carries the agent's name
+  - chatgpt codex # ChatGPT.app's embedded Codex helpers ("Codex (Renderer)",
+                  # "Codex (Service)", Resources/codex app-server) — GUI-app
+                  # plumbing, matched via the "ChatGPT" bundle prefix; not agents
+  - codex computer use  # ~/.codex/computer-use desktop-automation helper app
+
+# Optional: per-instance labels from launchd job labels — the supervised-fleet
+# counterpart of tmux_labels below. Several LaunchAgents running the same
+# binary (e.g. ai.hermes.gateway, ai.hermes.gateway-frontdoor, …) all hit one
+# agents: entry and land as indistinguishable rows, and tmux never sees them.
+# When a matched root's own launchd job label matches this regex, the first
+# capture group (the whole label if no group) becomes the row label — churn
+# tracking, alert transitions, and /metrics all get per-instance identity.
+# tmux_labels wins when both apply. Empty/absent = off.
+launchd_labels: "^ai\\.hermes\\.(?:gateway-)?(.+)$"   # → gateway, frontdoor, engineering_3
 
 # Optional: per-instance labels from tmux session names. A fleet of identical
 # agents (e.g. several claude-code bots, one per tmux session bot-*) all hit
@@ -82,7 +96,9 @@ tmux_labels: "^bot-(.+)$"      # session bot-coder_1 → row label coder_1
 idle_ok:
   - admin
   - coder        # covers coder_1…coder_4
-  - hermes
+  - hermes       # covers the launchd_labels-renamed rows too (gateway,
+                 # frontdoor, engineering_*) — suppression matches the BASE
+                 # matcher label as well as the instance label
   - codex
 
 # GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -197,8 +198,24 @@ def test_idle_badge_suppressed_for_waiting_class_label(monkeypatch):
         monkeypatch.setattr(m, "IDLE_OK", ["vll"])  # substring, like ignore:
         row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
         assert row["flag"] is None  # waiting-class label: no idle badge
+        # a tmux/launchd-derived instance label must not lose the class-level
+        # suppression — match the base matcher label too
+        monkeypatch.setattr(m, "LAUNCHD_LABELS", re.compile(r"^ai\.vllm\.(.+)$"))
+
+        def fake_cached(key, ttl, fn):
+            if key == "launchd":
+                return {pid: "ai.vllm.frontdoor"}
+            if key.startswith("keepalive:"):
+                return fn()
+            return {}
+
+        monkeypatch.setattr(m, "_cached", fake_cached)
+        row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
+        assert row["label"] == "frontdoor"  # no "vll" substring — base label carries it
+        assert row["flag"] is None  # idle_ok: [vll] still applies via the base label
     finally:
         _cleanup_label("vllm", (pid,))
+        _cleanup_label("frontdoor", (pid,))
 
 
 def test_supervised_row_exposes_keepalive(monkeypatch):
@@ -225,6 +242,59 @@ def test_supervised_row_exposes_keepalive(monkeypatch):
         assert row["keepalive"] is False  # RunAtLoad-only: a signal does stop it
     finally:
         _cleanup_label("ollama", (pid,))
+
+
+def test_instance_label_precedence_tmux_then_launchd_then_base(monkeypatch):
+    meta: dict = {}
+    # launchd fallback when tmux is off/absent
+    monkeypatch.setattr(m, "TMUX_LABELS", None)
+    monkeypatch.setattr(m, "LAUNCHD_LABELS", re.compile(r"^ai\.hermes\.(.+)$"))
+    assert (
+        m._instance_label(100, "hermes", meta, {}, {100: "ai.hermes.gateway-frontdoor"})
+        == "gateway-frontdoor"
+    )
+    # regex without a group → the whole job label
+    monkeypatch.setattr(m, "LAUNCHD_LABELS", re.compile(r"^ai\.hermes\."))
+    assert m._instance_label(100, "hermes", meta, {}, {100: "ai.hermes.gateway"}) == (
+        "ai.hermes.gateway"
+    )
+    # a job label that doesn't match the regex keeps the matcher label
+    assert m._instance_label(100, "hermes", meta, {}, {100: "com.other.job"}) == "hermes"
+    # no job at all → matcher label
+    assert m._instance_label(100, "hermes", meta, {}, {}) == "hermes"
+    # tmux wins when both apply — a bot in a tmux session keeps its session
+    # identity even under a generic supervising job
+    monkeypatch.setattr(m, "TMUX_LABELS", re.compile(r"^bot-(.+)$"))
+    monkeypatch.setattr(m, "LAUNCHD_LABELS", re.compile(r"^ai\.hermes\.(.+)$"))
+    assert (
+        m._instance_label(100, "claude-code", meta, {100: "bot-admin"},
+                          {100: "ai.hermes.gateway"})
+        == "admin"
+    )
+
+
+def test_launchd_labels_give_supervised_fleet_per_instance_rows(monkeypatch):
+    pid = 95000
+    proc = FakeProc(pid, ["python3", "-m", "hermes_cli.main"], ct=time.time() - 30)
+
+    def fake_cached(key, ttl, fn):
+        if key == "launchd":
+            return {pid: "ai.hermes.gateway-frontdoor"}
+        if key.startswith("keepalive:"):
+            return fn()
+        return {}
+
+    monkeypatch.setattr(m, "_cached", fake_cached)
+    monkeypatch.setattr(m, "_cpu_mem", lambda p, pm: (1.0, 50.0))
+    monkeypatch.setattr(m, "_collect", lambda: _fake_table([proc]))
+    monkeypatch.setattr(m, "TMUX_LABELS", None)
+    monkeypatch.setattr(m, "LAUNCHD_LABELS", re.compile(r"^ai\.hermes\.(?:gateway-)?(.+)$"))
+    try:
+        row = next(a for a in m.list_agents()["agents"] if a["pid"] == pid)
+        assert row["label"] == "frontdoor"  # not the shared "hermes" blur
+        assert row["supervised"] == "ai.hermes.gateway-frontdoor"
+    finally:
+        _cleanup_label("frontdoor", (pid,))
 
 
 def test_signal_tree_refuses_on_create_time_mismatch(monkeypatch):

@@ -73,6 +73,27 @@ def test_load_idle_ok(tmp_path):
     assert m.load_idle_ok(cfg) == []
 
 
+def test_load_launchd_labels(tmp_path):
+    cfg = tmp_path / "agents.yaml"
+    cfg.write_text(
+        "agents:\n  - label: x\n    match: x\n"
+        "launchd_labels: '^ai\\.hermes\\.(?:gateway-)?(.+)$'\n"
+    )
+    rx = m.load_launchd_labels(cfg)
+    assert rx is not None
+    mo = rx.search("ai.hermes.gateway-frontdoor")
+    assert mo and mo.group(1) == "frontdoor"
+    assert rx.search("ai.hermes.gateway").group(1) == "gateway"
+    cfg.write_text("agents:\n  - label: x\n    match: x\n")  # absent → off
+    assert m.load_launchd_labels(cfg) is None
+    cfg.write_text("agents: [broken")  # malformed → fail-soft like load_ignore
+    assert m.load_launchd_labels(cfg) is None
+    cfg.write_text(
+        "agents:\n  - label: x\n    match: x\nlaunchd_labels: '([a'\n"  # bad regex → off
+    )
+    assert m.load_launchd_labels(cfg) is None
+
+
 @pytest.fixture
 def client():
     # base_url matters: the browser guard rejects non-local Host headers, and
@@ -168,6 +189,9 @@ def test_host_guard_blocks_dns_rebinding(client):
     # A rebinding attack arrives with the attacker's domain in Host.
     r = client.get("/api/agents", headers={"host": "evil.example.com:8765"})
     assert r.status_code == 403
+    # The refusal names the remedy, not just the guard — a tailnet/MagicDNS
+    # bookmark hitting this should know what to do next.
+    assert "127.0.0.1" in r.json()["detail"]
 
 
 def test_host_guard_allows_ip_literal(client):
@@ -213,7 +237,8 @@ def test_config_hot_reload(client, tmp_path, monkeypatch):
     cfg.write_text("agents:\n  - label: reloaded\n    match: zz-reload-probe\n")
     monkeypatch.setattr(m, "CONFIG_PATH", cfg)
     monkeypatch.setattr(m, "_config_mtime", None)
-    orig = (m.MATCHERS, m.PROTECT, m.IGNORE)
+    orig = (m.MATCHERS, m.PROTECT, m.IGNORE, m.ALERTS, m.TMUX_LABELS,
+            m.LAUNCHD_LABELS, m.IDLE_OK)
     try:
         m._maybe_reload_config()
         assert [x.label for x in m.MATCHERS] == ["reloaded"]
@@ -226,8 +251,92 @@ def test_config_hot_reload(client, tmp_path, monkeypatch):
         assert [x.label for x in m.MATCHERS] == ["reloaded"]
         assert "not valid YAML" in m.CONFIG_ERROR
     finally:
-        m.MATCHERS, m.PROTECT, m.IGNORE = orig
+        (m.MATCHERS, m.PROTECT, m.IGNORE, m.ALERTS, m.TMUX_LABELS,
+         m.LAUNCHD_LABELS, m.IDLE_OK) = orig
         m.CONFIG_ERROR = None
+
+
+def test_deleted_config_is_surfaced_not_silent(tmp_path, monkeypatch):
+    # Deleting the config mid-run must NOT look like hot-reload still works:
+    # kill policy is frozen on the last good config, and the header says so.
+    import agent_usage_manager.app as m
+
+    cfg = tmp_path / "agents.yaml"
+    cfg.write_text("agents:\n  - label: x\n    match: x\n")
+    monkeypatch.setattr(m, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(m, "_config_mtime", None)
+    orig = (m.MATCHERS, m.PROTECT, m.IGNORE, m.ALERTS, m.TMUX_LABELS,
+            m.LAUNCHD_LABELS, m.IDLE_OK)
+    try:
+        m._maybe_reload_config()
+        assert m.CONFIG_ERROR is None
+        cfg.unlink()
+        m._maybe_reload_config()
+        assert m.CONFIG_ERROR is not None
+        assert "missing" in m.CONFIG_ERROR
+        assert "last good config" in m.CONFIG_ERROR
+        # restored → the error clears on the next reload
+        cfg.write_text("agents:\n  - label: x\n    match: x\n")
+        m._maybe_reload_config()
+        assert m.CONFIG_ERROR is None
+
+        # rename away and back (mtime preserved): still surfaces, still clears
+        # — an unchanged-mtime return must not leave the error stuck
+        aside = cfg.with_suffix(".gone")
+        cfg.rename(aside)
+        m._maybe_reload_config()
+        assert m.CONFIG_ERROR is not None and "missing" in m.CONFIG_ERROR
+        aside.rename(cfg)
+        m._maybe_reload_config()
+        assert m.CONFIG_ERROR is None
+    finally:
+        (m.MATCHERS, m.PROTECT, m.IGNORE, m.ALERTS, m.TMUX_LABELS,
+         m.LAUNCHD_LABELS, m.IDLE_OK) = orig
+        m.CONFIG_ERROR = None
+
+
+def test_test_alert_subcommand(monkeypatch, capsys, tmp_path):
+    from agent_usage_manager import cli
+
+    # no alerts block → clear exit 2, nothing run
+    monkeypatch.setattr(m, "ALERTS", None)
+    assert cli._run_test_alert() == 2
+
+    # happy path → exit 0
+    monkeypatch.setattr(
+        m, "ALERTS", {"command": "true", "cooldown": 600, "flags": {"hot"}, "leak_floor_mb": 0}
+    )
+    assert cli._run_test_alert() == 0
+
+    # failing command → exit 1, stderr carried through
+    monkeypatch.setattr(
+        m, "ALERTS",
+        {"command": "echo boom >&2; exit 3", "cooldown": 600, "flags": {"hot"}, "leak_floor_mb": 0},
+    )
+    assert cli._run_test_alert() == 1
+    assert "boom" in capsys.readouterr().err
+
+    # the env contract: $AUM_MSG reaches the command, marked as a test
+    out = tmp_path / "msg.txt"
+    monkeypatch.setattr(
+        m, "ALERTS",
+        {"command": f'printf %s "$AUM_MSG" > {out}', "cooldown": 600,
+         "flags": {"hot"}, "leak_floor_mb": 0},
+    )
+    assert cli._run_test_alert() == 0
+    assert "Test alert" in out.read_text()
+
+
+def test_list_json_marks_flags_unavailable(capsys):
+    # One-shot mode has no history, so flag fields can never populate — the
+    # payload must say so instead of silently serving always-null flags.
+    import json
+
+    from agent_usage_manager import cli
+
+    cli._run_list(True)
+    data = json.loads(capsys.readouterr().out)
+    assert data["flags_available"] is False
 
 
 def test_flags_need_sustained_window():
@@ -439,3 +548,49 @@ def test_csrf_guard_allows_same_origin_kill(client):
         headers={"origin": "http://127.0.0.1", "host": "127.0.0.1", **TOKEN},
     )
     assert r.status_code == 404
+
+
+def test_config_flag_survives_before_subcommand(monkeypatch):
+    # `--config X list` (flag BEFORE the subcommand) must set AGENTS_CONFIG.
+    # argparse subparser defaults used to clobber the top-level value with
+    # None, silently falling back to the cwd/bundled config.
+    from agent_usage_manager import cli
+
+    seen = {}
+    monkeypatch.setattr(
+        cli, "_run_list",
+        lambda as_json: seen.setdefault("cfg", os.environ.get("AGENTS_CONFIG")),
+    )
+    monkeypatch.setattr(
+        "sys.argv", ["agent-usage-manager", "--config", "/tmp/whatever.yaml", "list"]
+    )
+    old = os.environ.pop("AGENTS_CONFIG", None)
+    try:
+        cli.main()
+        assert seen["cfg"] == "/tmp/whatever.yaml"
+    finally:
+        if old is None:
+            os.environ.pop("AGENTS_CONFIG", None)
+        else:
+            os.environ["AGENTS_CONFIG"] = old
+
+
+def test_config_flag_survives_before_test_alert(monkeypatch):
+    from agent_usage_manager import cli
+
+    monkeypatch.setattr(cli, "_run_test_alert", lambda: 0)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["agent-usage-manager", "--config", "/tmp/whatever.yaml", "test-alert"],
+    )
+    old = os.environ.pop("AGENTS_CONFIG", None)
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main()
+        assert e.value.code == 0
+        assert os.environ.get("AGENTS_CONFIG") == "/tmp/whatever.yaml"
+    finally:
+        if old is None:
+            os.environ.pop("AGENTS_CONFIG", None)
+        else:
+            os.environ["AGENTS_CONFIG"] = old

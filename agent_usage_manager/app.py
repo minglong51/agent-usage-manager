@@ -197,6 +197,39 @@ def load_tmux_labels(path: Optional[Path] = None) -> Optional[re.Pattern]:
         return None
 
 
+def load_launchd_labels(path: Optional[Path] = None) -> Optional[re.Pattern]:
+    """Optional `launchd_labels:` regex — per-instance labels from launchd jobs.
+
+        launchd_labels: "^ai\\.hermes\\.(?:gateway-)?(.+)$"
+            # job ai.hermes.gateway-engineering_3 → row label engineering_3
+
+    The launchd counterpart of `tmux_labels:`: a supervised fleet (several
+    hermes gateways as LaunchAgents) all hits one `agents:` entry, and tmux
+    can't tell them apart — they never touch a tmux session. The launchd job
+    label IS their durable identity (stable across respawns, unlike the pid).
+    When a matched root's own launchd job label matches this regex, the row is
+    labeled with the first capture group (the whole label if the regex has no
+    group). tmux labels win when both apply (a bot running in tmux under a
+    generic supervising job keeps its session identity).
+
+    Best-effort like load_tmux_labels(): absent or malformed means "off".
+    """
+    path = path or CONFIG_PATH
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pattern = data.get("launchd_labels")
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
+
 def load_idle_ok(path: Optional[Path] = None) -> list[str]:
     """Labels for which idle is the NORMAL state — no `idle` badge.
 
@@ -226,6 +259,7 @@ MATCHERS, PROTECT = load_config()
 IGNORE = load_ignore()
 ALERTS = load_alerts()
 TMUX_LABELS = load_tmux_labels()
+LAUNCHD_LABELS = load_launchd_labels()
 IDLE_OK = load_idle_ok()
 SELF_PID = os.getpid()
 
@@ -237,6 +271,13 @@ except OSError:
     _config_mtime = None
 
 
+def _config_missing_msg() -> str:
+    return (
+        f"{CONFIG_PATH} is missing — running on the last good config; "
+        "edits are not being picked up"
+    )
+
+
 def _maybe_reload_config() -> None:
     """Pick up agents.yaml edits without a server restart.
 
@@ -245,13 +286,23 @@ def _maybe_reload_config() -> None:
     it. The bad mtime is recorded so the file isn't re-parsed on every poll —
     only the next edit triggers another attempt.
     """
-    global MATCHERS, PROTECT, IGNORE, ALERTS, TMUX_LABELS, IDLE_OK, CONFIG_ERROR, _config_mtime
+    global MATCHERS, PROTECT, IGNORE, ALERTS, TMUX_LABELS, LAUNCHD_LABELS, IDLE_OK, CONFIG_ERROR, _config_mtime
     try:
         mtime = CONFIG_PATH.stat().st_mtime
     except OSError:
+        # The config VANISHED (deleted/renamed mid-session). Keep running on
+        # the last good config but say so — otherwise the header keeps
+        # claiming "edits hot-reload" while kill policy is silently frozen.
+        with _config_lock:
+            if CONFIG_ERROR != _config_missing_msg():
+                CONFIG_ERROR = _config_missing_msg()
         return
     with _config_lock:
         if mtime == _config_mtime:
+            # A restored file with unchanged content: clear the missing-file
+            # error (mtime alone can't distinguish "never left" from "back").
+            if CONFIG_ERROR == _config_missing_msg():
+                CONFIG_ERROR = None
             return
         _config_mtime = mtime
         try:
@@ -263,6 +314,7 @@ def _maybe_reload_config() -> None:
         IGNORE = load_ignore()
         ALERTS = load_alerts()
         TMUX_LABELS = load_tmux_labels()
+        LAUNCHD_LABELS = load_launchd_labels()
         IDLE_OK = load_idle_ok()
         CONFIG_ERROR = None
 
@@ -554,15 +606,24 @@ def _tmux_panes() -> dict[int, str]:
     return panes
 
 
-def _instance_label(root: int, base: str, meta: dict, panes: dict[int, str]) -> str:
+def _instance_label(
+    root: int, base: str, meta: dict, panes: dict[int, str], jobs: dict[int, str]
+) -> str:
     """Display label for one agent root: tmux-derived when configured and
-    applicable, else the matcher label.
+    applicable, else launchd-derived when configured and applicable, else the
+    matcher label.
 
-    Nearest enclosing pane wins: the root often IS the pane process (a shell
-    that exec'd the agent), otherwise the ancestor walk finds the pane shell
-    that spawned it. A root inside a session that doesn't match the
-    `tmux_labels:` regex keeps the base label — the walk stops at its own
-    pane rather than borrowing an outer session's name.
+    tmux first: nearest enclosing pane wins (the root often IS the pane
+    process, otherwise the ancestor walk finds the pane shell that spawned
+    it). A root inside a session that doesn't match the `tmux_labels:` regex
+    keeps walking no further — it falls through to the launchd/base label
+    rather than borrowing an outer session's name.
+
+    launchd second: the root's own job label (its durable supervised identity,
+    stable across respawns) matched against `launchd_labels:`, first capture
+    group or the whole label. This is what gives a supervised fleet (several
+    hermes gateways as LaunchAgents) per-instance identity for churn tracking,
+    alert transitions, and /metrics — tmux never sees those processes.
     """
     rx = TMUX_LABELS
     if rx and panes:
@@ -574,6 +635,15 @@ def _instance_label(root: int, base: str, meta: dict, panes: dict[int, str]) -> 
             if mo:
                 return (mo.group(1) if mo.groups() else mo.group(0)) or base
             break
+    lx = LAUNCHD_LABELS
+    if lx:
+        job = jobs.get(root)
+        if job:
+            mo = lx.search(job)
+            if mo:
+                # No capture group → the whole job label (it IS the instance's
+                # name); a prefix-only match would make a useless label.
+                return (mo.group(1) if mo.groups() else job) or base
     return base
 
 
@@ -662,7 +732,9 @@ async def _browser_guard(request: Request, call_next):
     #     `Origin: null` (sandboxed iframe, file://) is foreign by this rule.
     if not _host_allowed(request.headers.get("host", "")):
         return JSONResponse(
-            {"detail": "Host header is not a local address — refusing (DNS-rebinding guard)"},
+            {"detail": "Host header is not a local address — refusing (DNS-rebinding "
+                       "guard). Use http://127.0.0.1:<port> or the host's bare IP "
+                       "instead of a DNS name."},
             status_code=403,
         )
     origin = request.headers.get("origin")
@@ -1096,11 +1168,11 @@ def list_agents() -> dict:
         info = meta[root]
         rproc = procmap.get(root)
         cmd = _cmdline(rproc) if rproc else info["name"]
-        # The per-instance label (tmux-derived when configured) is used for
-        # everything identity-shaped downstream — churn tracking, alert
-        # transitions, /metrics series — so a fleet of same-matcher bots gets
-        # per-bot state instead of one blurred series.
-        label = _instance_label(root, label_of[root], meta, panes)
+        # The per-instance label (tmux- or launchd-derived when configured) is
+        # used for everything identity-shaped downstream — churn tracking,
+        # alert transitions, /metrics series — so a fleet of same-matcher
+        # bots gets per-bot state instead of one blurred series.
+        label = _instance_label(root, label_of[root], meta, panes, jobs)
         ct = info["ct"] or now
         hkey = (root, ct)
         current_keys.add(hkey)
@@ -1116,9 +1188,14 @@ def list_agents() -> dict:
             # Churn outranks hot/idle: a respawning process can't accrue
             # either window, and the loop itself is the urgent signal.
             flag = "churn"
-        if flag == "idle" and any(p in label.lower() for p in IDLE_OK):
+        if flag == "idle" and any(
+            p in label.lower() or p in label_of[root].lower() for p in IDLE_OK
+        ):
             # Waiting-class label (agents.yaml `idle_ok:`): idle is its NORMAL
-            # state, so the badge is wallpaper, not signal.
+            # state, so the badge is wallpaper, not signal. Matched against the
+            # instance label AND the base matcher label — a `launchd_labels:` /
+            # `tmux_labels:` rename (hermes → frontdoor) must not lose the
+            # class-level suppression.
             flag = None
         agents.append(
             Agent(

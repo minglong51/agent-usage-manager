@@ -131,6 +131,7 @@ let tokenPath = "";         // where the kill token lives on disk (from /api/age
 const rowKey = x => x.pid + ":" + x.create_time;
 const expanded = new Map(); // row key -> pid, for rows whose subtree is unfolded
 const bodies = new Map();   // row key -> its <tbody> (one tbody per agent: row + children)
+const lastRows = new Map(); // row key -> last-seen agent payload (kill confirm context)
 
 // Reordering rows under the pointer relocates the kill button mid-aim — freeze
 // the ORDER (not the data) while the pointer is over the table.
@@ -174,27 +175,41 @@ function spark(trend) {
 // agents are exactly the callers the token exists to stop. So the operator
 // pastes it once (from the 0600 token file the server points at) and it stays
 // in this browser's localStorage, out of reach of same-host curl.
+let hostName = "";           // the SERVER's hostname (from /api/agents)
 function killToken() {
   let t = localStorage.getItem("killToken");
   if (!t) {
+    const where = tokenPath || "the server's app-support dir";
     t = (prompt("First kill from this browser — paste the kill token.\n" +
-                "It's in: " + (tokenPath || "the server's app-support dir") +
+                "It's in: " + where +
+                (hostName ? " on " + hostName : "") +
+                (hostName ? "\nFrom this machine: ssh " + hostName +
+                            " cat '" + where + "'" : "") +
                 "\n(Stored in this browser; you won't be asked again.)") || "").trim();
     if (t) localStorage.setItem("killToken", t);
   }
   return t;
 }
 
-async function kill(pid, force, children) {
-  const verb = force ? "FORCE KILL (SIGKILL)" : "kill (SIGTERM)";
-  const kids = children > 0
-    ? ` and its ${children} child process${children > 1 ? "es" : ""}`
+async function kill(key, force) {
+  const x = lastRows.get(key);
+  if (!x) return;
+  // Plain kill is SIGTERM, but the server auto-escalates survivors to SIGKILL
+  // after 3s — say so, or "kill" reads as graceful-only and a bot trapping
+  // SIGTERM for a state write gets SIGKILLed mid-write while the operator
+  // believes they chose the safe option.
+  const verb = force ? "FORCE KILL (SIGKILL)" : "kill (SIGTERM → SIGKILL after 3s)";
+  const kids = x.child_count > 0
+    ? ` and its ${x.child_count} child process${x.child_count > 1 ? "es" : ""}`
     : "";
-  if (!confirm(verb + " PID " + pid + kids + "?")) return;
+  // Identify the target by label + command, not just PID: rows in a fleet
+  // share labels, and the PID is the one identifier the operator can't check
+  // against intent.
+  if (!confirm(`${verb} ${x.label} (PID ${x.pid})${kids}?\n${x.cmdline.slice(0, 120)}`)) return;
   const token = killToken();
   if (!token) return;
   try {
-    const r = await fetch(`/api/kill/${pid}?force=${force}`,
+    const r = await fetch(`/api/kill/${x.pid}?force=${force}`,
                           {method: "POST", headers: {"X-Kill-Token": token}});
     const j = await r.json();
     if (r.status === 403 && (j.detail || "").includes("X-Kill-Token")) {
@@ -288,10 +303,11 @@ function rowHTML(x, cpus, now) {
   const actions = x.supervised
     ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${esc(x.stop_hint)}</code>`
     : `<button class="kill" ${x.protected?'disabled':''}${protectedNote}
-        onclick="kill(${x.pid}, false, ${x.child_count})">kill</button>
+        title="SIGTERM; anything still up after 3s gets SIGKILL"
+        onclick="kill('${key}', false)">kill</button>
       <button class="kill ghost" ${x.protected?'disabled':''}
         title="SIGKILL — forceful, no cleanup. Use only if plain kill won't stop it."
-        onclick="kill(${x.pid}, true, ${x.child_count})">force</button>`;
+        onclick="kill('${key}', true)">force</button>`;
   return `<tr>
     <td><span class="label">${esc(x.label)}</span>${svc}${flag}${kids}</td>
     <td class="c-pid">${x.pid}</td>
@@ -329,6 +345,7 @@ async function refresh() {
   }
   lastOk = new Date();
   tokenPath = data.token_path || tokenPath;
+  hostName = data.host || hostName;
 
   const a = data.agents;
   const totCpu = a.reduce((s, x) => s + x.cpu_percent, 0);
@@ -371,9 +388,11 @@ async function refresh() {
   const flagRank = {hot: 0, churn: 1, leak: 2, idle: 3};
   a.sort((p, q) => (flagRank[p.flag] ?? 4) - (flagRank[q.flag] ?? 4));
   const seen = new Set();
+  lastRows.clear();
   for (const x of a) {
     const key = rowKey(x);
     seen.add(key);
+    lastRows.set(key, x);
     let tb = bodies.get(key);
     if (!tb) {
       tb = document.createElement("tbody");
