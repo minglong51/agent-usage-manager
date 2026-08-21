@@ -41,7 +41,10 @@ def _resolve_config() -> Path:
     cwd_cfg = Path.cwd() / "agents.yaml"
     if cwd_cfg.exists():
         return cwd_cfg
-    return BASE / "agents.yaml"
+    local = BASE / "agents.yaml"
+    if local.exists():
+        return local
+    return BASE / "agents.default.yaml"
 
 
 CONFIG_PATH = _resolve_config()
