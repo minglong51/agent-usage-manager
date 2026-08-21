@@ -4,14 +4,14 @@ A small web dashboard for **headless AI agents** running on a machine —
 OpenClaw, Hermes, Claude Code, Ollama, vLLM, llama.cpp, or anything you name. It
 shows which agents are alive and what they're costing you (CPU, memory, GPU), and
 gives you a **kill button** per agent. Think `htop`, scoped to just your agents —
-the [screenshot below](docs/dashboard.png) is a real run on a fleet node.
+the [screenshot below](https://raw.githubusercontent.com/minglong51/agent-usage-manager/main/docs/dashboard.png) is a real run on a fleet node.
 
 No database, no auth framework (one static token file gates the kill switch),
 four direct dependencies (FastAPI, uvicorn, psutil, PyYAML). Runs on macOS and Linux. It is a
 per-node monitor and guarded local control panel: fleet schedulers may consume
 its read-only telemetry, but should own their own scheduling and actuation.
 
-![agent-usage-manager — live dashboard](docs/dashboard.png)
+![agent-usage-manager — live dashboard](https://raw.githubusercontent.com/minglong51/agent-usage-manager/main/docs/dashboard.png)
 
 *A real run: ten agents grouped by process tree (`+N` = children rolled up),
 per-agent CPU/memory/uptime, launchd-supervised jobs flagged, and a kill button
@@ -39,7 +39,10 @@ uvx agent-usage-manager      # then open http://127.0.0.1:8765 (opens automatica
 One command — no install, no virtualenv, no leftovers. Other install options,
 config, and flags: [Install & run](#install--run).
 
-![one command to a live dashboard](docs/demo.gif)
+![one command to a live dashboard](https://raw.githubusercontent.com/minglong51/agent-usage-manager/main/docs/demo.gif)
+
+*Field notes on running agents with discipline go out on the
+[Agent Discipline](https://buttondown.com/minglong51) list — a few emails a month.*
 
 ## What it does
 

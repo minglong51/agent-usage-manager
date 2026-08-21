@@ -1,0 +1,129 @@
+# Default configuration shipped with the package. It is used only when you have
+# no agents.yaml of your own: `--config` wins, then ./agents.yaml in the current
+# directory, then this file. Copy it somewhere and edit rather than editing it
+# in place — a package upgrade replaces this file.
+#
+# Which processes count as "agents". A process matches if the pattern hits its
+# executable name + first few arguments (case-insensitive substring or regex) —
+# NOT the entire command line, so a process that merely mentions an agent name
+# deep in its args (e.g. inside a system prompt) is not misclassified.
+# Only processes that match here can be listed AND killed — the kill endpoint
+# re-checks the match before sending a signal, so the dashboard can never be
+# used to kill an arbitrary unrelated PID.
+#
+# Matched processes are grouped by process tree: one row per agent (the root),
+# with child processes rolled up. CPU/mem/GPU are tree totals, and "kill" stops
+# the whole tree (root + children) so spawned helpers don't leak resources.
+agents:
+  - label: openclaw
+    match: openclaw
+  - label: hermes
+    match: hermes
+  - label: claude-code
+    match: "claude(\\s|$|-code)"
+    regex: true
+  - label: kiro
+    match: "\\bkiro\\b"        # word-anchored so it doesn't hit any kiro-named path
+    regex: true
+  - label: aider
+    match: "\\baider\\b"       # anchored: bare 'aider' matches 'raider', 'spider'…
+    regex: true
+  - label: codex
+    match: "\\bcodex\\b"
+    regex: true
+  - label: cline
+    match: "\\bcline\\b"       # anchored: bare 'cline' matches 'decline', 'incline'
+    regex: true
+  - label: ollama
+    match: ollama
+  - label: vllm
+    match: vllm
+  - label: llama.cpp
+    match: llama-server
+
+# Patterns that must NEVER be killed even if they match an agent pattern above.
+# Self (this monitor's own PID) and PID 1 are always protected in code.
+protect:
+  - agent-usage-manager
+  - uvicorn
+
+# Patterns that disqualify a process from being an agent at all — not listed,
+# not killable. Use this for incidental processes that share a name or bundle
+# path with a real agent. Checked against the same match target (executable
+# basename + first args + macOS .app bundle name), case-insensitive substring.
+#
+# Why these: a GUI agent like Kiro.app launches its main process as "Electron",
+# so agents are matched by the .app bundle name ("Kiro"). That also sweeps in the
+# app's crash handler, its Squirrel auto-updater (ShipIt), and the editor's
+# integrated-terminal shells (titled "kiro-cli-term") — none of which are the
+# agent. Ignoring them leaves one clean row for the app (helpers roll up under
+# it) instead of a cluster of un-killable, self-respawning fragments.
+ignore:
+  - crashpad      # chrome_crashpad_handler — the bundle's crash reporter
+  - shipit        # Squirrel.framework auto-updater
+  - kiro-cli-term # Kiro's integrated-terminal shells (zsh), not the agent
+  - autoupdate    # Sparkle's Autoupdate helper — Codex.app's ShipIt equivalent
+  - updater       # Sparkle's Updater.app; argv[1] is the app path, so it matches
+  - for chrome    # "Codex for Chrome" extension host, not the agent
+  - tmux attach   # tmux clients: `attach -t <session>` carries the agent's name
+  - chatgpt codex # ChatGPT.app's embedded Codex helpers ("Codex (Renderer)",
+                  # "Codex (Service)", Resources/codex app-server) — GUI-app
+                  # plumbing, matched via the "ChatGPT" bundle prefix; not agents
+  - codex computer use  # ~/.codex/computer-use desktop-automation helper app
+
+# Optional: per-instance labels from launchd job labels — the supervised-fleet
+# counterpart of tmux_labels below. Several LaunchAgents running the same
+# binary all hit one agents: entry and land as indistinguishable rows, and tmux
+# never sees them. When a matched root's own launchd job label matches this
+# regex, the first capture group (the whole label if no group) becomes the row
+# label — churn tracking, alert transitions, and /metrics all get per-instance
+# identity. tmux_labels wins when both apply. Empty/absent = off.
+#
+#   launchd_labels: "^com\\.example\\.worker-(.+)$"   # → worker-1, worker-2
+
+# Optional: per-instance labels from tmux session names. A fleet of identical
+# agents (e.g. several claude-code bots, one per tmux session) all hit one
+# agents: entry above and land as N indistinguishable rows — their cmdlines
+# can't tell them apart, because matching deliberately sees only the executable
+# + first args. The tmux session each one runs in IS its identity: when a
+# matched root (or an ancestor) is a tmux pane whose session name matches this
+# regex, the row is labeled with the first capture group (the whole session
+# name if there is no group). Sessions that don't match keep their agents:
+# label, so incidental tmux use never renames rows.
+#
+#   tmux_labels: "^bot-(.+)$"      # session bot-worker1 → row label worker1
+
+# Labels whose idle state is NORMAL — agents that wait for work (bots parked on
+# a chat poll, gateways waiting for requests). They get no "idle" badge: badging
+# the whole waiting fleet wallpapers the dashboard and trains badge-blindness.
+# Same reasoning as `idle` being opt-in for alerts below. Case-insensitive
+# substrings of the row label (incl. tmux-derived ones), like ignore:.
+#
+#   idle_ok:
+#     - gateway
+#     - worker
+
+# GPU sampling: nvidia-smi is used automatically when present (Linux/NVIDIA).
+# On Apple Silicon there is no per-process GPU API, so the GPU column is blank.
+
+# Optional: run a command when a badge appears on an agent — a dashboard only
+# helps while someone is looking at it. The command runs through the shell with
+# details in env vars: $AUM_MSG (ready-made one-liner), $AUM_LABEL, $AUM_FLAG,
+# $AUM_PID, $AUM_CPU, $AUM_MEM_MB, $AUM_RESTARTS, $AUM_HOST. Fires on a flag
+# APPEARING (once per transition, with a per-agent-per-flag cooldown); server
+# mode only — `list` never alerts. By default only hot/churn/leak alert: for a
+# fleet of agents that wait for work, idle is the NORMAL state, and alerting on
+# it floods the channel every time the server restarts and re-learns the fleet.
+#
+# Nothing is wired by default — uncomment and point it at your own channel, then
+# prove it with `agent-usage-manager test-alert` before a real badge depends on
+# it. Two things worth knowing before you turn `hot` on: for inference agents
+# pegged CPU IS the job, and spawn-heavy agents look like churn while working.
+#
+#   alerts:
+#     command: 'terminal-notifier -title agent-usage-manager -message "$AUM_MSG"'
+#     cooldown: 600              # seconds, default 600
+#     flags: [hot, churn, leak]  # default; add idle only if you really want it
+#     leak_floor_mb: 1536        # only alert on leak once the absolute footprint
+#                                # is large — long-running agents legitimately
+#                                # ratchet RSS as their context grows
