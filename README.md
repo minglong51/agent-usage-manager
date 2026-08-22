@@ -109,13 +109,19 @@ config, and flags: [Install & run](#install--run).
   while your pointer is over the table, so the kill button can't shift under your
   cursor mid-click.
 
-## Why not just htop / Grafana?
+## Why not just htop / Grafana / OTel?
 
 - **htop sees processes, not agents.** No rollup of a spawned tree under the
   agent that owns it, no agent states (crash-looping, idle, leaking), and an
   unguarded `F9`.
 - **Grafana + Prometheus + an exporter is a stack you operate.** This is one
   command with no database — and it still serves `/metrics` if you want both.
+- **OTel GenAI telemetry stops at the process line.** The GenAI semantic
+  conventions standardized what an agent *spent* — session spans, token
+  counters like `gen_ai.usage.input_tokens`, cost rollups — and the vendor
+  dashboards consume them natively. They don't model whether the host process
+  is wedged, crash-looping, or leaking; the agent CLIs don't export even
+  their own pid. That half needs its own tool.
 - **The kill switch is the point.** Allowlist-matched, token-gated, guarded
   against CSRF and DNS rebinding, with an append-only action log — a web page
   that can stop processes needs exactly those.
