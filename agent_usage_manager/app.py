@@ -691,11 +691,18 @@ async def _lifespan(_: FastAPI):
 app = FastAPI(title="agent-usage-manager", lifespan=_lifespan)
 
 
-# Loopback names are always local. The ts.net FQDN is the tailnet front door:
-# `tailscale serve --https=8448` proxies to this app and preserves the Host
-# header. Only tailscaled can mint that name/cert for this node, so allowing
-# it does not reopen the DNS-rebinding hole _host_allowed exists to close.
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "minglongs-mac-mini.tailab5be0.ts.net"}
+# Loopback names are always local. Anything else must be opted in per install via
+# AUM_TRUSTED_HOSTS (comma-separated hostnames) — typically the FQDN of a reverse
+# proxy or tailnet front door that preserves the Host header, e.g.
+# `tailscale serve --https=8448` fronting this app. Only add a name that nobody
+# else can mint a cert for on this node; any other name reopens the DNS-rebinding
+# hole _host_allowed exists to close.
+def _configured_trusted_hosts() -> set[str]:
+    raw = os.environ.get("AUM_TRUSTED_HOSTS", "")
+    return {h.strip().lower() for h in raw.split(",") if h.strip()}
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"} | _configured_trusted_hosts()
 
 
 def _hostname_of(hostport: str) -> str:
