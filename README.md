@@ -182,6 +182,18 @@ This is the important part — a web page that can kill processes needs guardrai
   actions. That is deliberate (owner-only tailnet + token-gated actions), but do
   not read "loopback-only" as "not network-reachable" — a proxy in front is not
   a trust boundary.
+- **Fronting it with a proxy needs `AUM_TRUSTED_HOSTS`.** The DNS-rebinding guard
+  refuses any request whose `Host` is a non-local DNS name — which is exactly what
+  a proxy forwards. Opt that one name in explicitly:
+
+  ```bash
+  AUM_TRUSTED_HOSTS=box.your-tailnet.ts.net agent-usage-manager
+  ```
+
+  Comma-separated for several. Only add a name nobody else can mint a cert for on
+  this node; a name you don't control reopens the hole the guard exists to close.
+  Empty by default — out of the box only `localhost`, `127.0.0.1` and `::1` are
+  accepted.
 
 ## Limits & known issues
 
