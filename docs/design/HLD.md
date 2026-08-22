@@ -1,6 +1,6 @@
 # agent-usage-manager — High-Level Design
 
-**Refreshed:** 2026-08-19 (0.2.5).
+**Refreshed:** 2026-08-22 (service-cite de-staled); previously 2026-08-19 (0.2.5).
 
 ## Purpose
 
@@ -78,7 +78,8 @@ each probed with `shutil.which` and degrading to empty results when absent:
   `--unsafe-expose` (cli.py:219-225). On Ming's host a `tailscale serve` proxy
   (:8448) fronts that loopback bind — tailnet-reachable by design, token-gated
   for actions; the loopback refusal covers direct binds only (2026-08-14 note).
-- **As a service:** README.md:377-392 documents a systemd user unit; on this
+- **As a service:** the README's *Run as a service* section documents a
+  systemd user unit; on this
   host it runs under launchd, and the bundled `agents.yaml:133-139` wires alerts
   into the fleet's Telegram notifier.
 - **CI/release:** GitHub Actions test matrix; hatchling builds published to
