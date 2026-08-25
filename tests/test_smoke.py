@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -122,6 +123,29 @@ def test_api_agents_ok(client):
 
 def test_index_serves(client):
     assert client.get("/").status_code == 200
+
+
+def test_index_frontend_regressions(client):
+    # Static contracts behind the 2026-08-24 dogfood frontend fixes (there is
+    # no JS test runner here; these pin the served page's behavior-bearing
+    # markup so the fixed paths can't silently regress).
+    html = client.get("/").text
+    # A denied clipboard write must say so, not fail silently (bug #1).
+    copy_fn = re.search(r"function copyHint\(.*?\n\}", html, re.S)
+    assert copy_fn, "copyHint not found in served page"
+    assert ".catch(" in copy_fn.group(0)
+    assert "copy failed" in copy_fn.group(0)
+    # Mid-width dead zone (bug #2): the actions column is sticky-pinned to the
+    # right edge so the kill verb is reachable while .wrap scrolls.
+    assert "position: sticky" in html
+    assert 'class="c-act"' in html
+    # Phone stack (F1/F2/F3): numbers carry their units, child rows keep the
+    # cmdline that is their only identity, and the launchd hint clips its
+    # identical 'launchctl …' prefix (rtl) instead of the job label.
+    assert '<span class="unit">%</span>' in html
+    assert '<span class="unit"> MB</span>' in html
+    assert "tr.child td.c-cmd" in html
+    assert "direction: rtl" in html
 
 
 def test_kill_pid1_refused(client):
