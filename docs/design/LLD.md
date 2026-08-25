@@ -1,6 +1,8 @@
 # agent-usage-manager — Low-Level Design
 
-**Refreshed:** 2026-08-19 (0.2.5 — `launchd_labels:`, `test-alert`, missing-config
+**Refreshed:** 2026-08-25 (frontend dogfood fixes — clipboard-denial path,
+sticky actions column, phone units/child-cmdline/left-truncated hint);
+previously 2026-08-19 (0.2.5 — `launchd_labels:`, `test-alert`, missing-config
 surfacing, kill-confirm/token-prompt wording, `list` flags caveat).
 
 Code layout: one FastAPI module (`agent_usage_manager/app.py`), one CLI module
@@ -314,18 +316,18 @@ Applies to every request:
 
 ## 6. Frontend (static/index.html)
 
-Single inline `<script>` (index.html:119-418), no framework.
+Single inline `<script>` (index.html:140-460), no framework.
 
-- **Poll loop:** `refresh()` every 3s (index.html:417-418). On fetch failure
+- **Poll loop:** `refresh()` every 3s (index.html:459-460). On fetch failure
   the table is kept but dimmed with a stale banner (`body.stale`,
-  index.html:343-351) — never blank data someone might kill from. Skips
+  index.html:378-387) — never blank data someone might kill from. Skips
   re-render while text is selected (copying a launchctl hint).
 - **Keyed rendering:** one `<tbody>` per agent, keyed by `pid:create_time`
   (`rowKey`; the `bodies`/`expanded` maps) so a recycled pid can't inherit
   another agent's row; rows are rewritten in place, tbodys sorted
   flagged-first (hot/churn/leak/idle, then the server's CPU-desc order within
   a group) but **only reordered when the pointer is off the table**
-  (`overTable`, index.html:137-140, 406-410) so the kill button can't shift
+  (`overTable`, index.html:159-161, 450-454) so the kill button can't shift
   under the cursor. The header carries the flag counts (`1 hot · 4 idle`).
 - **Kill flow:** `kill(rowKey, force)` — the row's payload is looked up in
   `lastRows` (keyed by `pid:create_time`, rebuilt each refresh) so the
@@ -342,19 +344,28 @@ Single inline `<script>` (index.html:119-418), no framework.
   ✓ and ✗ result lines auto-clear on a `setTimeout` (longer for the ✗
   partial-failure, which needs reading time) so no outcome sticks forever.
 - **Tree expansion:** `toggleTree`/`loadTree`/`renderTree`
-  (index.html:255-276) fetch `/api/tree/{pid}` and insert indented child rows;
-  expanded subtrees are re-fetched on every refresh (index.html:414).
+  (index.html:297-318) fetch `/api/tree/{pid}` and insert indented child rows;
+  expanded subtrees are re-fetched on every refresh (index.html:456).
 - **Rendering details:** `esc()` HTML-escapes all host data (injection into a
-  page with a kill endpoint is a real risk, index.html:143-148); `spark()`
+  page with a kill endpoint is a real risk, index.html:165-170); `spark()`
   draws the SVG sparkline; badges hot/idle/churn/leak with explanatory
-  tooltips (index.html:291-299; the launchd badge's tooltip follows the
+  tooltips (index.html:333-341; the launchd badge's tooltip follows the
   payload's `keepalive` — "won't stick" only for KeepAlive jobs); supervised
   rows swap kill buttons for a
-  click-to-copy `launchctl bootout` hint; GPU column hidden when nothing
-  reports GPU (`body.hide-gpu`); protected rows get disabled buttons (the
-  server refuses regardless). At ≤700px rows stack (agent+badges / cpu·mem /
+  click-to-copy `launchctl bootout` hint whose denial path is loud — a
+  rejected clipboard write flashes "copy failed" on the chip and selects the
+  command for a manual ⌘C, never a silent no-op; GPU column hidden when
+  nothing reports GPU (`body.hide-gpu`); protected rows get disabled buttons
+  (the server refuses regardless). The actions column is `position: sticky`
+  on the right above the phone breakpoint (`.c-act`, index.html:35-39), so
+  the kill verb stays on-screen while the ~1.5kpx-wide nowrap table scrolls
+  horizontally at mid-width. At ≤700px rows stack (agent+badges / cpu·mem /
   actions), the sparkline hides, and the column headers drop, so the
-  kill verb is on-screen at phone width.
+  kill verb is on-screen at phone width; with the headers gone the cpu/mem
+  numbers carry their own units (`.unit`), child rows keep their cmdline
+  (their only identity, `tr.child td.c-cmd`), and the launchd hint truncates
+  from the left (`direction: rtl`) so the job label — not the identical
+  `launchctl bootout gui/501/` prefix — stays visible.
 
 ## 7. Error handling conventions
 

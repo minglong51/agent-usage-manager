@@ -27,6 +27,18 @@
   td.cmd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
            max-width: 380px; color: #8b949e; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  /* The all-nowrap table measures ~1.5kpx wide, so between the phone stack
+     (≤700px) and a full-width window .wrap scrolls horizontally and the last
+     column — the only kill verb — sits off-screen. Pin the actions column to
+     the right edge so it's reachable at every width. The nowrap launchctl hint
+     inflates the column's width, so right-align too: the verbs hug the pinned
+     edge instead of the cell's left. Phone rows are stacked blocks with no
+     horizontal overflow, so this is desk/mid-width only. */
+  @media (min-width: 701px) {
+    .c-act { position: sticky; right: 0; background: #0d1117;
+             border-left: 1px solid #21262d; text-align: right; }
+    tr.child td.c-act { background: #0b0f14; }
+  }
   .label { background: #1f6feb33; color: #79c0ff; padding: 1px 7px;
            border-radius: 10px; font-size: 12px; }
   .svc { background: #bb800933; color: #d29922; padding: 1px 7px; margin-left: 5px;
@@ -44,6 +56,9 @@
   .kids { color: #79c0ff; font-size: 11px; margin-left: 5px; cursor: pointer;
           border-bottom: 1px dotted #30363d; }
   .kids:hover { color: #a5d6ff; }
+  /* Units are hidden on desk — the column headers already say "cpu %"/"mem MB".
+     The phone stack drops the headers, so there the numbers carry their own. */
+  .unit { display: none; }
   .spark { display: block; margin-top: 3px; }
   .spark polyline { fill: none; stroke: #d29922; stroke-width: 1.2; }
   .spark line { stroke: #21262d; stroke-width: 1; }
@@ -72,11 +87,19 @@
   @media (max-width: 700px) {
     th, td { padding: 6px 8px; }
     .c-status, .c-up, .c-cmd, .c-pid { display: none; }  /* keep agent/cpu/mem/actions */
+    /* …but a child row's cmdline IS its identity (on desk it's what tells the
+       zsh wrapper from the helper from the MCP server) — keep it, wrapped. */
+    tr.child td.c-cmd { display: block; max-width: none; white-space: normal;
+                        overflow-wrap: anywhere; }
+    .unit { display: inline; }  /* headers are gone below — numbers self-label */
     header { padding: 10px 12px; gap: 10px; }
     #stale { padding: 6px 12px; }
-    /* visually truncate the launchctl hint; click-to-copy still copies the full text */
-    code.hint { display: inline-block; max-width: 110px; overflow: hidden;
-                text-overflow: ellipsis; vertical-align: middle; }
+    /* Truncate the launchctl hint from the LEFT: every supervised row starts
+       with the identical 'launchctl bootout gui/501/', so clipping the right
+       end renders every row's chip the same and ellipses the job label — the
+       one part that differs. Click-to-copy still copies the full text. */
+    code.hint { display: inline-block; max-width: 240px; overflow: hidden;
+                text-overflow: ellipsis; vertical-align: middle; direction: rtl; }
     /* The flat table measures ~554px, so at 375px the kill verb sits off-screen.
        Stack each row instead — agent+badges / cpu·mem / actions — with column
        headers gone (they no longer map to anything) and the sparkline hidden
@@ -109,7 +132,7 @@
       <th>agent</th><th class="c-pid">pid</th><th class="c-status">status</th>
       <th class="num">cpu %</th><th class="num">mem MB</th>
       <th class="num gpu">gpu MB</th><th class="num c-up">uptime</th>
-      <th class="c-cmd">command</th><th></th>
+      <th class="c-cmd">command</th><th class="c-act"></th>
     </tr>
   </thead>
 </table>
@@ -234,21 +257,44 @@ async function kill(key, force) {
 }
 
 function copyHint(el) {
-  navigator.clipboard?.writeText(el.textContent).then(() => {
+  // A denied clipboard write (permission prompt dismissed, unfocused document,
+  // no clipboard API) must not fail silently — the operator would walk away
+  // believing they hold a bootout command they don't have. Say so, then select
+  // the chip text so a manual ⌘C still works (an active selection also pauses
+  // auto-refresh — see refresh() — so the re-render can't yank it mid-copy).
+  const fail = () => {
     const prev = el.textContent;
-    el.textContent = "copied ✓";
-    setTimeout(() => { el.textContent = prev; }, 1000);
-  });
+    el.textContent = "copy failed — press ⌘C";
+    setTimeout(() => {
+      // a refresh() re-render may have replaced the row mid-flash
+      if (!el.isConnected) return;
+      el.textContent = prev;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }, 1500);
+  };
+  try {
+    const w = navigator.clipboard && navigator.clipboard.writeText(el.textContent);
+    if (!w) { fail(); return; }
+    w.then(() => {
+      const prev = el.textContent;
+      el.textContent = "copied ✓";
+      setTimeout(() => { el.textContent = prev; }, 1000);
+    }).catch(fail);
+  } catch (e) { fail(); }
 }
 
 function childRows(tree) {
   return tree.filter(c => c.depth > 0).map(c => `<tr class="child">
     <td style="padding-left:${12 + c.depth * 14}px">↳ ${esc(c.name)}</td>
     <td class="c-pid">${c.pid}</td><td class="c-status"></td>
-    <td class="num">${c.cpu_percent.toFixed(1)}</td>
-    <td class="num">${c.mem_mb.toFixed(0)}</td>
+    <td class="num">${c.cpu_percent.toFixed(1)}<span class="unit">%</span></td>
+    <td class="num">${c.mem_mb.toFixed(0)}<span class="unit"> MB</span></td>
     <td class="num gpu"></td><td class="num c-up"></td>
-    <td class="cmd c-cmd" title="${esc(c.cmdline)}">${esc(c.cmdline)}</td><td></td>
+    <td class="cmd c-cmd" title="${esc(c.cmdline)}">${esc(c.cmdline)}</td><td class="c-act"></td>
   </tr>`).join("");
 }
 
@@ -312,12 +358,12 @@ function rowHTML(x, cpus, now) {
     <td><span class="label">${esc(x.label)}</span>${svc}${flag}${kids}</td>
     <td class="c-pid">${x.pid}</td>
     <td class="c-status"><span class="dot ${x.alive?'live':'dead'}"></span>${esc(x.status)}</td>
-    <td class="num" title="${x.cpu_percent.toFixed(0)}% of one core · ${(x.cpu_percent/cpus).toFixed(0)}% of all ${cpus} cores">${x.cpu_percent.toFixed(1)}${spark(x.trend)}</td>
-    <td class="num">${x.mem_mb.toFixed(0)}</td>
+    <td class="num" title="${x.cpu_percent.toFixed(0)}% of one core · ${(x.cpu_percent/cpus).toFixed(0)}% of all ${cpus} cores">${x.cpu_percent.toFixed(1)}<span class="unit">%</span>${spark(x.trend)}</td>
+    <td class="num">${x.mem_mb.toFixed(0)}<span class="unit"> MB</span></td>
     <td class="num gpu">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
     <td class="num c-up">${dur(x.uptime_s)}</td>
     <td class="cmd c-cmd" title="${esc(x.cmdline)}">${esc(x.cmdline)}</td>
-    <td>${actions}</td>
+    <td class="c-act">${actions}</td>
   </tr>`;
 }
 
