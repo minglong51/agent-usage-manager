@@ -1,0 +1,103 @@
+name: Bug report
+description: Report reproducible behavior with sanitized evidence
+title: "[bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove tokens, hostnames, usernames,
+        home paths, internal labels, and full process command lines before
+        submitting. Report security-sensitive behavior privately through the
+        repository security policy.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Process matching
+        - Resource reporting
+        - Dashboard
+        - Stop control
+        - Alerts
+        - CLI or API
+        - Installation or startup
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: aum_version
+    attributes:
+      label: AUM version
+      description: Use `aum_version` from `list --json` or provide the Git commit.
+      placeholder: "0.2.6"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating_system
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - uvx
+        - pipx
+        - pip in a virtual environment
+        - Source checkout
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest sanitized config or command shape needed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Optional logs, JSON, or screenshots with identifying data removed.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I tested the latest release or current `main`.
+          required: true
+        - label: I removed tokens, hostnames, usernames, paths, internal labels, and full command lines.
+          required: true
+        - label: This is not a security-sensitive report.
+          required: true

@@ -1,9 +1,7 @@
 # agent-usage-manager — Low-Level Design
 
-**Refreshed:** 2026-08-25 (frontend dogfood fixes — clipboard-denial path,
-sticky actions column, phone units/child-cmdline/left-truncated hint);
-previously 2026-08-19 (0.2.5 — `launchd_labels:`, `test-alert`, missing-config
-surfacing, kill-confirm/token-prompt wording, `list` flags caveat).
+**Refreshed:** 2026-08-26 (public/private config boundary); previously
+2026-08-25 (frontend dogfood fixes).
 
 Code layout: one FastAPI module (`agent_usage_manager/app.py`), one CLI module
 (`agent_usage_manager/cli.py`), one static frontend
@@ -17,8 +15,10 @@ in the threadpool).
 
 - `_resolve_config() -> Path` (app.py:37-47) — resolved **once at import**:
   `$AGENTS_CONFIG` env var (set by the `--config` flag, cli.py:110-111) →
-  `./agents.yaml` in the launch cwd → the package-bundled
-  `agent_usage_manager/agents.yaml`. Stored in module-global `CONFIG_PATH`.
+  `./agents.yaml` in the launch cwd → an untracked package-local
+  `agent_usage_manager/agents.yaml` when present in a source checkout → the
+  sanitized package-bundled `agents.default.yaml`. Stored in module-global
+  `CONFIG_PATH`.
 - `load_config(path) -> tuple[list[Matcher], list[str]]` (app.py:64-89) —
   strict loader for `agents:` + `protect:`; raises `RuntimeError` on unreadable
   file, invalid YAML, non-mapping root, missing `label`/`match`, or a bad
@@ -41,7 +41,7 @@ in the threadpool).
   not look like hot-reload still works; the error clears when the file
   returns, including the rename-back case where the mtime is unchanged.
 
-### 1.2 agents.yaml schema (agent_usage_manager/agents.yaml)
+### 1.2 agents.yaml schema (`agents.default.yaml` is the public example)
 
 ```yaml
 agents:                       # required: the allowlist (list AND killability)
@@ -51,9 +51,9 @@ agents:                       # required: the allowlist (list AND killability)
 protect: [uvicorn, ...]       # matched + listed, kill refused (substring, lowercased)
 ignore: [crashpad, ...]       # never an agent: not listed, not killable
 tmux_labels: "^bot-(.+)$"     # optional: per-instance label from tmux session name
-launchd_labels: "^ai\\.hermes\\.(?:gateway-)?(.+)$"
+launchd_labels: "^com\\.example\\.agent\\.(.+)$"
                               # optional: per-instance label from the launchd job label
-idle_ok: [admin, ...]         # optional: labels whose idle is NORMAL — no idle badge
+idle_ok: [worker, ...]        # optional: labels whose idle is NORMAL — no idle badge
                               # (matches the instance label AND the base matcher label)
 alerts:                       # optional: shell command on badge appearance
   command: '...$AUM_MSG...'   # run via shell; data rides $AUM_* env vars only
@@ -294,10 +294,9 @@ Applies to every request:
 - `_bind_allowed(host, unsafe_expose) -> bool` (cli.py:13-28) — True for
   `localhost`, loopback IPs, or when `--unsafe-expose` was passed; anything
   else is a `parser.error` at startup (fail closed — the kill endpoint must
-  not reach a network on a casual flag). Deployment caveat (2026-08-14): the
-  production host fronts the loopback bind with `tailscale serve` (:8448), so
-  the tailnet reaches the UI despite this check — a proxy in front is not a
-  trust boundary, and the static kill token is the real boundary there.
+  not reach a network on a casual flag). A reverse proxy can still expose the
+  loopback bind: the proxy is not itself a trust boundary, read endpoints need
+  access control, and the static kill token remains the action boundary.
 - `_run_list(as_json)` (cli.py:60-107) — lazily imports `app` (no uvicorn
   import, no sampler thread, so no alerts), calls `list_agents()` twice with a
   0.5s gap (first `cpu_percent` read is always 0.0), prints raw JSON or an

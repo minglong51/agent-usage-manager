@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Private security report
+    url: https://github.com/minglong51/agent-usage-manager/security/advisories/new
+    about: Report authorization, kill-path, redaction, or package-privacy defects privately.

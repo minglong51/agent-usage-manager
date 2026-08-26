@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .DS_Store
 agents.local.yaml
+agent_usage_manager/agents.yaml
 dist/
 build/
 *.egg-info/

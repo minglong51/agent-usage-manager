@@ -1,6 +1,6 @@
 # agent-usage-manager — High-Level Design
 
-**Refreshed:** 2026-08-22 (service-cite de-staled); previously 2026-08-19 (0.2.5).
+**Refreshed:** 2026-08-26 (public/private config boundary); previously 2026-08-25.
 
 ## Purpose
 
@@ -11,7 +11,7 @@ It groups matched processes by process tree, shows per-agent liveness, CPU %,
 RSS, GPU memory (NVIDIA only), uptime, a ~20-minute CPU sparkline, and four
 sustained-state badges (`hot` / `idle` / `churn` / `leak`), and offers a
 token-gated kill button that stops the whole tree. It is deliberately **not** a
-fleet scheduler or multi-host orchestrator (README.md "Product boundary"):
+fleet scheduler or multi-host orchestrator (README.md "Per-node only"):
 external control planes may consume its read-only telemetry (`/api/agents`,
 `/metrics`, `list --json`) but should own their own actuation. No database, no
 auth framework — one FastAPI app, one static HTML page, psutil, and a `0600`
@@ -26,7 +26,7 @@ token file.
     POST /api/kill        │                                              │
     + X-Kill-Token)       │  reads:                                      │
                           │   • psutil process table (all processes)     │
-   curl / scripts ──────► │   • agents.yaml (hot-reloaded on mtime)      │
+   curl / scripts ──────► │   • resolved agents.yaml (hot-reloaded)      │
    (list --json is the    │   • nvidia-smi  (GPU mem, Linux/NVIDIA)      │──► SIGTERM/SIGKILL
     no-server variant)    │   • launchctl list/print (macOS supervision  │    to matched
                           │     + launchd_labels: instance identity)     │    process trees
@@ -51,12 +51,12 @@ each probed with `shutil.which` and degrading to empty results when absent:
 | `agent_usage_manager/app.py` (~1500 lines) | Everything server-side: config loading + hot reload, process collection/matching, tree rollup, CPU/mem/GPU sampling, history + flag heuristics, churn tracking, per-instance labels (tmux/launchd), alert dispatch, kill token + action log, browser guard middleware, all HTTP endpoints (`/`, `/api/agents`, `/api/tree/{pid}`, `/api/kill/{pid}`, `/metrics`, `/static`). |
 | `agent_usage_manager/cli.py` | The `agent-usage-manager` console entrypoint (pyproject.toml:28): argparse flags, fail-closed bind check (`_bind_allowed`, cli.py:10), browser auto-open, `uvicorn.run(...)` (cli.py:133), and the serverless `list` subcommand (`_run_list`, cli.py:40). |
 | `agent_usage_manager/static/index.html` | The entire frontend: dark-theme table UI, 3s poll loop, sparklines, badge rendering, kill/force buttons with confirm + token paste prompt (localStorage), tree expansion, stale-data banner, pointer-freeze row ordering. No build step, no JS dependencies. |
-| `agent_usage_manager/agents.yaml` | Default (bundled) config: `agents:` matchers, `protect:`, `ignore:`, `tmux_labels:`, `alerts:`. Doubles as documented example. |
+| `agent_usage_manager/agents.default.yaml` | Sanitized bundled fallback: `agents:` matchers, `protect:`, `ignore:`, plus commented examples for optional labels and alerts. Operator configs remain outside Git. |
 | `tests/test_smoke.py` | Unit + API tests: redaction, match-target rules, config validation, guard middleware (DNS-rebind/CSRF), token gating, flag windows, alert transitions/cooldown, hot reload. |
 | `tests/test_synthetic.py` | Synthetic trace fixtures (hot/idle/churn/leak series), fake process tables for churn/leak surfacing, kill-path pid/create_time pinning, real-process kill test, adversarial matcher cases. |
 | `run.sh` | Dev launcher from a clone: creates `.venv`, editable install, runs the CLI. |
 | `.github/workflows/ci.yml` | CI: `pytest -q` on ubuntu + macos × Python 3.9 / 3.12 on push/PR. |
-| `pyproject.toml` | Hatchling build; version 0.2.5; publishes wheel/sdist (built artifacts in `dist/`). |
+| `pyproject.toml` | Hatchling build; version 0.2.6; publishes wheel/sdist (built artifacts in `dist/`). |
 | `demo.tape` | VHS tape for the README demo GIF. |
 
 ## Runtime / deploy model
@@ -72,16 +72,14 @@ each probed with `shutil.which` and degrading to empty results when absent:
   (`~/Library/Application Support/agent-usage-manager` on macOS,
   `$XDG_STATE_HOME/agent-usage-manager` elsewhere — app.py:322-340): the
   auto-generated `0600` `kill_token` and the append-only `actions.log`.
-- **Install/run paths:** `uvx agent-usage-manager` (recommended, README.md:36),
+- **Install/run paths:** `uvx agent-usage-manager` (recommended),
   `pipx`/`pip install agent-usage-manager`, or `./run.sh` from a clone. Binds
   `127.0.0.1:8765` by default and refuses non-loopback hosts without
-  `--unsafe-expose` (cli.py:219-225). On Ming's host a `tailscale serve` proxy
-  (:8448) fronts that loopback bind — tailnet-reachable by design, token-gated
-  for actions; the loopback refusal covers direct binds only (2026-08-14 note).
-- **As a service:** the README's *Run as a service* section documents a
-  systemd user unit; on this
-  host it runs under launchd, and the bundled `agents.yaml:133-139` wires alerts
-  into the fleet's Telegram notifier.
+  `--unsafe-expose` (cli.py:219-225). A reverse proxy can still expose a
+  loopback-bound service, so operators must authenticate the proxy and opt its
+  hostname into `AUM_TRUSTED_HOSTS`; the loopback refusal covers direct binds.
+- **As a service:** `docs/reference.md` documents a systemd user unit. Other
+  supervisors invoke the same CLI with an operator-owned external config.
 - **CI/release:** GitHub Actions test matrix; hatchling builds published to
   PyPI (the `uvx` path depends on that).
 

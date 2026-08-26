@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-usage-manager"
 version = "0.2.6"
-description = "htop for AI agents — liveness, CPU/mem/GPU usage, and a kill switch for headless agents (openclaw, hermes, ollama, vllm, claude-code)."
+description = "Local htop-style dashboard and guarded kill switch for headless AI-agent processes."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -40,16 +40,27 @@ dev = ["pytest>=7", "httpx>=0.27"]
 Homepage = "https://github.com/minglong51/agent-usage-manager"
 Repository = "https://github.com/minglong51/agent-usage-manager"
 Issues = "https://github.com/minglong51/agent-usage-manager/issues"
-Newsletter = "https://buttondown.com/minglong51"
+Documentation = "https://github.com/minglong51/agent-usage-manager/blob/main/docs/reference.md"
+Changelog = "https://github.com/minglong51/agent-usage-manager/blob/main/CHANGELOG.md"
+Security = "https://github.com/minglong51/agent-usage-manager/security/policy"
 
 [project.scripts]
 agent-usage-manager = "agent_usage_manager.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_usage_manager"]
-# agents.yaml is the maintainer's live config in a source checkout, not a
-# shippable default — the wheel carries agents.default.yaml instead.
+# agents.yaml is an operator-owned source-checkout config, not a shippable
+# default; the wheel carries agents.default.yaml instead.
 exclude = ["agent_usage_manager/agents.yaml"]
 
 [tool.hatch.build.targets.sdist]
+include = [
+    "/agent_usage_manager",
+    "/docs/reference.md",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
 exclude = ["agent_usage_manager/agents.yaml"]
