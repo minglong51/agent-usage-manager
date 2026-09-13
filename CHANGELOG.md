@@ -25,6 +25,8 @@ remain the source for release artifacts.
   unavailable, and exposes runtime, instance, warning, and delivery metadata.
 - Actionable stop requests require the exact `create_time` from the displayed
   row. The dashboard also checks the reviewed tree revision before signaling.
+- Stop review stays bound to the child details actually displayed, including
+  while text selection defers a refresh; changed or unavailable scope disables it.
 - Failed alert commands retry while the condition persists, with visible
   delivery state and a bounded three-attempt limit.
 - Runtime-wide short-lived exits are separated from proven launchd service

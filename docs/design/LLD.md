@@ -462,9 +462,12 @@ One static HTML document with embedded CSS and JavaScript; no framework or build
   Cache entries retain history, evidence, revision, and timestamp along with rows.
   Each child has a disclosure for its timestamp, CPU, protection, and redacted
   command, so command inspection also works with touch and keyboard.
-- **Stop review:** `openStop()` captures an immutable `dialogSnap` in a body-level
-  native dialog. PID, exact start time, label, command excerpt, child count, and
-  signal behavior are shown before confirmation. The primary choice sends
+- **Stop review:** `inspectedSnapshot` binds the stop control to the tree revision
+  actually rendered in the inspector, retaining that revision when text selection
+  defers a refresh. Missing details or a revision different from the latest row
+  disable review. `openStop()` captures that snapshot as an immutable `dialogSnap`
+  in a body-level native dialog. PID, exact start time, label, command excerpt,
+  child count, and signal behavior are shown before confirmation. The primary choice sends
   SIGTERM and escalates survivors to SIGKILL after three seconds. A secondary
   choice switches to an explicit immediate-SIGKILL confirmation. `stopProblem()`
   rechecks freshness, current identity, protection, supervision, and the captured

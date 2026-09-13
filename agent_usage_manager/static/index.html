@@ -202,7 +202,7 @@ let data=null,lastFetchOk=0,fetchFail=null,pollTimer=null,refreshPending=null;
 let selectedKey=null,lastSeen=null;
 let eventView=null,eventRequest=0;
 const rowEls=new Map(),openFolds=new Set(),treeCache=new Map(),treePending=new Set();
-let dialogSnap=null,dialogForce=false,pendingStop=false;
+let inspectedSnapshot=null,dialogSnap=null,dialogForce=false,pendingStop=false;
 let tokenPath="",hostName="",lastRuntimeKey=null;
 let pointerOver=false,focusWithin=false,resultTimer=null;
 
@@ -455,6 +455,7 @@ function renderInspector(){
   const viewKey=eventView?"event:"+eventView.id:selectedKey;
   const preserve=el.dataset.key===viewKey;
   if(preserve&&String(window.getSelection&&window.getSelection()||"").length)return;
+  inspectedSnapshot=null;
   el.dataset.key=viewKey||"";
   el.hidden=!viewKey;
   document.body.classList.toggle("detail-open",!!viewKey);
@@ -468,6 +469,9 @@ function renderInspector(){
     return;
   }
   lastSeen=a;
+  const cached=treeCache.get(keyOf(a));
+  const reviewSnapshot={...a,key:keyOf(a),tree_revision:a.tree_revision===undefined?undefined:cached?.tree_revision??null};
+  const reviewProblem=stopProblem(reviewSnapshot);
   const supLine=a.supervised
     ?`Managed by launchd · job ${esc(a.supervised)}${a.username?" · as "+esc(a.username):""}`
     :`${esc(a.label)} · independently launched${a.username?" · as "+esc(a.username):""}`;
@@ -487,9 +491,10 @@ function renderInspector(){
   }else if(a.protected){
     actions='<div class="actions"><button class="pill ink" disabled>Stop unavailable</button><p>Protected process — the monitor refuses to stop it.</p></div>';
   }else{
-    actions=`<div class="actions"><button class="pill ink" id="review-stop"${isStale()||a.tree_revision===null?" disabled":""}>Review stop…</button><p>${a.tree_revision===null?"Some process identities could not be read. Stop is unavailable.":`Reviews the root identity and ${a.child_count} observed child process${a.child_count===1?"":"es"} before signaling.`}</p></div>`;
+    actions=`<div class="actions"><button class="pill ink" id="review-stop"${reviewProblem||pendingStop?" disabled":""}>Review stop…</button><p>${reviewProblem?esc(reviewProblem):`Reviews the root identity and ${a.child_count} observed child process${a.child_count===1?"":"es"} before signaling.`}</p></div>`;
   }
   replacePanel(el,`${inspectorHead("Process · "+a.pid)}<h2>${esc(labelOf(a))}${flagChip(a,data.ts)}</h2><p class="identity">${esc(runtimeOf(a))} · working directory: ${esc(projectOf(a))}<br>Started ${day(a.create_time)} · ${source}</p>${sharedIdentity(a)?'<p class="observation">This name is shared by another process. The directory does not identify a unique task.</p>':!a.evidence?'<p class="observation">This is a process tree. Task progress and conversation identity are not available.</p>':""}<dl class="info-grid"><div><dt>Tree RSS</dt><dd>${Math.round(a.mem_mb)} MB</dd></div><div><dt>CPU / core</dt><dd>${number(a.cpu_percent)}%</dd></div><div><dt>Children</dt><dd>${a.child_count}</dd></div>${gpu}</dl>${evidenceHTML(a.evidence)}${chartHTML(a)}${fold("resource",a.flag==="leak"?"CPU observations":"Memory observations",chartHTML(a,a.flag==="leak"?"cpu":"memory"))}${fold("tree",`Processes in this tree · ${a.child_count} children`,treeFoldBody(a))}${fold("command","Command excerpt",`<div class="cmd-view">${esc(a.cmdline||a.name||"")}</div><p class="quiet">Redacted; limited to the first 300 characters.</p><button class="pill mini" id="copy-cmd">Copy displayed command</button>`)}${fold("evidence","Observation details",`<ul class="events"><li>${supLine}</li><li>OS process state<small>${esc(a.status||"unknown")} · task progress unavailable</small></li><li>Service restart evidence<small>${restart}</small></li><li>Identity key<small>${esc(keyOf(a))}${a.instance_id?" · instance "+esc(a.instance_id):""}</small></li><li>Resource sample captured<small>${day(data.ts)} · host ${esc(data.host||"")}</small></li>${(a.evidence?.exit_timestamps||[]).map(t=>`<li>Observed short-lived service exit<small>${day(t)}</small></li>`).join("")}${a.event_id?`<li><a class="event-link" data-event="${esc(a.event_id)}" href="/?event=${encodeURIComponent(a.event_id)}">Inspect the warning's first observation ›</a></li>`:""}</ul>`)}${actions}`,preserve);
+  inspectedSnapshot=reviewSnapshot;
   wireBack();
   el.querySelectorAll("details[data-fold]").forEach(d=>{
     d.addEventListener("toggle",()=>{
@@ -504,7 +509,7 @@ function renderInspector(){
   const cc=$("#copy-cmd");
   if(cc)cc.addEventListener("click",()=>copyText(a.cmdline||a.name||"",cc,"copied ✓","copy failed — select the command",cc.parentElement.querySelector(".cmd-view")));
   const rs=$("#review-stop");
-  if(rs)rs.addEventListener("click",()=>openStop(a));
+  if(rs)rs.addEventListener("click",()=>openStop(reviewSnapshot));
   wireEventLinks(el);
 }
 
@@ -734,6 +739,7 @@ function stopProblem(snapshot){
   if(current.protected)return "This process is protected. Stop is unavailable.";
   if(current.supervised)return "This process is supervised. Use its service stop command.";
   if(current.tree_revision===null)return "Some process identities could not be read. Stop is unavailable.";
+  if(snapshot.tree_revision===null)return "Current process-tree details are unavailable. Wait for them to refresh before reviewing a stop.";
   if(snapshot.tree_revision&&current.tree_revision!==snapshot.tree_revision)return "The process tree changed. Close this review and inspect its current scope.";
   return "";
 }
@@ -742,7 +748,7 @@ function renderStale(){
   const stale=isStale();
   document.body.classList.toggle("stale",stale&&!!data);
   const review=$("#review-stop");
-  if(review)review.disabled=stale||pendingStop||!data.agents.some(a=>keyOf(a)===selectedKey&&!a.protected&&!a.supervised&&a.tree_revision!==null);
+  if(review)review.disabled=pendingStop||!inspectedSnapshot||!!stopProblem(inspectedSnapshot);
   if($("#confirm").open&&dialogSnap&&!pendingStop){
     const problem=stopProblem(dialogSnap);
     $("#do-stop").disabled=!!problem;
