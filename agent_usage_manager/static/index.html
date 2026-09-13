@@ -1,467 +1,847 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="icon" href="data:," />
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>agent usage manager</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%23b5382a' d='M4 4h10v10H4zm14 0h10v10H18zM4 18h10v10H4zm14 0h10v10H18z'/%3E%3C/svg%3E">
 <style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-         margin: 0; background: #0d1117; color: #c9d1d9; }
-  header { padding: 14px 20px; border-bottom: 1px solid #21262d;
-           display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
-  h1 { font-size: 16px; margin: 0; }
-  .meta { color: #8b949e; font-size: 12px; }
-  .cfg { color: #6e7681; font-size: 11px; flex-basis: 100%; }
-  .cfg.err { color: #f85149; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-         margin-right: 6px; vertical-align: middle; }
-  .live { background: #3fb950; } .dead { background: #f85149; }
-  .wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #161b22;
-           white-space: nowrap; }
-  th { color: #8b949e; font-weight: 600; font-size: 12px; text-transform: uppercase;
-       letter-spacing: .04em; }
-  td.cmd { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-           max-width: 380px; color: #8b949e; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  /* The all-nowrap table measures ~1.5kpx wide, so between the phone stack
-     (≤700px) and a full-width window .wrap scrolls horizontally and the last
-     column — the only kill verb — sits off-screen. Pin the actions column to
-     the right edge so it's reachable at every width. The nowrap launchctl hint
-     inflates the column's width, so right-align too: the verbs hug the pinned
-     edge instead of the cell's left. Phone rows are stacked blocks with no
-     horizontal overflow, so this is desk/mid-width only. */
-  @media (min-width: 701px) {
-    .c-act { position: sticky; right: 0; background: #0d1117;
-             border-left: 1px solid #21262d; text-align: right; }
-    tr.child td.c-act { background: #0b0f14; }
-  }
-  .label { background: #1f6feb33; color: #79c0ff; padding: 1px 7px;
-           border-radius: 10px; font-size: 12px; }
-  .svc { background: #bb800933; color: #d29922; padding: 1px 7px; margin-left: 5px;
-         border-radius: 10px; font-size: 11px; cursor: help; }
-  .flag { padding: 1px 7px; margin-left: 5px; border-radius: 10px; font-size: 11px;
-          cursor: help; }
-  .flag.hot { background: #da363333; color: #f85149; }
-  .flag.idle { background: #30363d66; color: #8b949e; }
-  .flag.churn { background: #d2992233; color: #e3b341; }
-  .flag.leak { background: #8957e533; color: #a371f7; }
-  code.hint { font: 12px ui-monospace, Menlo, monospace; color: #adbac7;
-              background: #161b22; border: 1px solid #21262d; border-radius: 6px;
-              padding: 4px 8px; cursor: copy; white-space: nowrap; }
-  code.hint:hover { border-color: #d29922; }
-  .kids { color: #79c0ff; font-size: 11px; margin-left: 5px; cursor: pointer;
-          border-bottom: 1px dotted #30363d; }
-  .kids:hover { color: #a5d6ff; }
-  /* Units are hidden on desk — the column headers already say "cpu %"/"mem MB".
-     The phone stack drops the headers, so there the numbers carry their own. */
-  .unit { display: none; }
-  .spark { display: block; margin-top: 3px; }
-  .spark polyline { fill: none; stroke: #d29922; stroke-width: 1.2; }
-  .spark line { stroke: #21262d; stroke-width: 1; }
-  tr.child td { color: #8b949e; font-size: 12px; background: #0b0f14;
-                border-bottom: 1px solid #11151b; padding-top: 4px; padding-bottom: 4px; }
-  tr.child td.cmd { max-width: 380px; }
-  button.kill { background: #da3633; color: #fff; border: 0; padding: 5px 12px;
-                border-radius: 6px; cursor: pointer; font: inherit; }
-  button.kill:hover { background: #f85149; }
-  button.kill:disabled { background: #30363d; color: #6e7681; cursor: not-allowed; }
-  /* force = SIGKILL, the more destructive action — render it secondary (ghost)
-     so it isn't a same-weight one-click neighbour of plain kill. */
-  button.kill.ghost { background: transparent; color: #8b949e; border: 1px solid #30363d;
-                      padding: 4px 9px; font-size: 12px; }
-  button.kill.ghost:hover { background: #da363322; color: #f85149; border-color: #da3633; }
-  button.kill.ghost:disabled { background: transparent; color: #484f58; border-color: #21262d; }
-  /* stale = last /api/agents fetch failed; dim the data we can no longer trust. */
-  #stale { display: none; background: #3d1d00; color: #d29922; font-size: 12px;
-           padding: 6px 20px; border-bottom: 1px solid #5a2d00; }
-  body.stale #stale { display: block; }
-  body.stale table { opacity: .45; transition: opacity .2s; }
-  .empty { padding: 40px 20px; color: #8b949e; }
-  .err { color: #f85149; }
-  .ok { color: #3fb950; }
-  body.hide-gpu .gpu { display: none; }   /* no GPU data (e.g. Apple Silicon) → drop the dead column */
-  @media (max-width: 700px) {
-    th, td { padding: 6px 8px; }
-    .c-status, .c-up, .c-cmd, .c-pid { display: none; }  /* keep agent/cpu/mem/actions */
-    /* …but a child row's cmdline IS its identity (on desk it's what tells the
-       zsh wrapper from the helper from the MCP server) — keep it, wrapped. */
-    tr.child td.c-cmd { display: block; max-width: none; white-space: normal;
-                        overflow-wrap: anywhere; }
-    .unit { display: inline; }  /* headers are gone below — numbers self-label */
-    header { padding: 10px 12px; gap: 10px; }
-    #stale { padding: 6px 12px; }
-    /* Truncate the launchctl hint from the LEFT: every supervised row starts
-       with the identical 'launchctl bootout gui/501/', so clipping the right
-       end renders every row's chip the same and ellipses the job label — the
-       one part that differs. Click-to-copy still copies the full text. */
-    code.hint { display: inline-block; max-width: 240px; overflow: hidden;
-                text-overflow: ellipsis; vertical-align: middle; direction: rtl; }
-    /* The flat table measures ~554px, so at 375px the kill verb sits off-screen.
-       Stack each row instead — agent+badges / cpu·mem / actions — with column
-       headers gone (they no longer map to anything) and the sparkline hidden
-       (a 64px block element would shove cpu/mem further down the stack). */
-    thead { display: none; }
-    tbody, tr, td { display: block; }
-    tr { padding: 8px 10px; border-bottom: 1px solid #161b22; }
-    td { border: 0; padding: 1px 0; white-space: normal; }
-    td:empty { display: none; }
-    /* :not(.c-up) — the uptime cell is .num too, and this rule must not
-       resurrect it past the .c-up hide above. */
-    td.num:not(.c-up) { display: inline-block; text-align: left; margin-right: 16px; }
-    body.hide-gpu .gpu { display: none; }  /* re-assert past the td.num rule above */
-    .spark { display: none; }
-  }
+:root { color-scheme:light; --bg:#f7f3e9; --panel:#fcf9f0; --line:#e2dbc9; --fg:#1b1812; --dim:#6d6454;
+          --meta:#7a7261; --accent:#1b1812; --warn:#7e5510; --bad:#b3362c; --good:#2e6b4f;
+          --red:#b5382a; --mark:#bd8272; --chipfg:#f7f3e9; --ico-bg:#efe7d6; --chev:#c9c1af;
+          --acc-tint:rgba(27,24,18,.07); --acc-border:rgba(27,24,18,.45);
+          --serif:"Hoefler Text", Palatino, Georgia, "Times New Roman", serif; }
+@media(prefers-color-scheme:dark){:root { color-scheme:dark; --bg:#171c22; --panel:#1e242c; --line:#2b333d; --fg:#e8e4dc; --dim:#9aa3ad;
+            --meta:#8a939d; --accent:#e8e4dc; --warn:#d9a84e; --bad:#e06552; --good:#6fbf8f;
+            --red:#e86450; --mark:#a87b6b; --chipfg:#171c22; --ico-bg:#2c2620; --chev:#5d6772;
+            --acc-tint:rgba(232,228,220,.10); --acc-border:rgba(232,228,220,.4); }}
+:root[data-theme="light"] { color-scheme:light; --bg:#f7f3e9; --panel:#fcf9f0; --line:#e2dbc9; --fg:#1b1812; --dim:#6d6454;
+          --meta:#7a7261; --accent:#1b1812; --warn:#7e5510; --bad:#b3362c; --good:#2e6b4f;
+          --red:#b5382a; --mark:#bd8272; --chipfg:#f7f3e9; --ico-bg:#efe7d6; --chev:#c9c1af;
+          --acc-tint:rgba(27,24,18,.07); --acc-border:rgba(27,24,18,.45);
+          --serif:"Hoefler Text", Palatino, Georgia, "Times New Roman", serif; }
+:root[data-theme="dark"] { color-scheme:dark; --bg:#171c22; --panel:#1e242c; --line:#2b333d; --fg:#e8e4dc; --dim:#9aa3ad;
+            --meta:#8a939d; --accent:#e8e4dc; --warn:#d9a84e; --bad:#e06552; --good:#6fbf8f;
+            --red:#e86450; --mark:#a87b6b; --chipfg:#171c22; --ico-bg:#2c2620; --chev:#5d6772;
+            --acc-tint:rgba(232,228,220,.10); --acc-border:rgba(232,228,220,.4); }
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,sans-serif}
+button,input,select{font:inherit;color:inherit}
+button,summary{cursor:pointer}
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+tr:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+button:disabled{opacity:.45;cursor:default}
+[hidden]{display:none!important}
+h1,h2,p,dl,ul{margin:0}
+.page{max-width:1180px;padding:22px 24px 60px;margin:auto}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.brand{font:600 19px var(--serif);display:flex;align-items:center;gap:9px;color:var(--fg);text-decoration:none}
+.mark{width:14px;height:14px;flex:0 0 auto;background:var(--red);box-shadow:inset 6px 0 var(--red);clip-path:polygon(0 0,43% 0,43% 43%,57% 43%,57% 0,100% 0,100% 43%,57% 43%,57% 57%,100% 57%,100% 100%,57% 100%,57% 57%,43% 57%,43% 100%,0 100%,0 57%,43% 57%,43% 43%,0 43%)}
+.quiet{color:var(--dim)}
+.smallcaps{font-size:10px;letter-spacing:.14em;text-transform:uppercase;font-weight:650;color:var(--dim)}
+.text-button{background:none;border:0;padding:7px 0;color:var(--dim);font-size:12px}
+.intro{margin:23px 0 18px}
+h1{font:500 28px/1.12 var(--serif);letter-spacing:-.02em}
+.intro p{font-size:12px;color:var(--dim);margin-top:8px;max-width:70ch}
+.totals{display:flex;gap:28px;padding:12px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:12px;color:var(--dim);flex-wrap:wrap}
+.totals:empty{border:0;padding:0;margin:0}
+.totals strong{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums;margin-right:4px}
+#health{margin-top:12px;font-size:12px}
+#health:empty{display:none}
+#stale{display:none;margin-top:12px;padding:12px;border:1px solid var(--warn);border-radius:12px;color:var(--warn);font-size:12px}
+body.stale #stale{display:block}
+#result{margin-top:12px;font-size:13px;font-weight:650}
+#result:empty{display:none}
+#result.ok{color:var(--good)}
+#result.err{color:var(--bad)}
+.issue{color:var(--warn)}
+.issue.err{color:var(--bad)}
+.workbench{margin-top:20px;display:block}
+body.detail-open .workbench{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:26px;align-items:start}
+body:not(.detail-open) .inspector{display:none}
+.filters{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+.filters input{flex:1;min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+.filters select{max-width:135px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:9px 10px;font-size:12px}
+.filter-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;font-size:11px;color:var(--dim)}
+.filter-row label{display:flex;gap:6px;align-items:center}
+.filter-row select{background:transparent;border:0;font-size:12px;color:var(--fg)}
+.filter-row .quiet{white-space:nowrap}
+.table-scroll{overflow:visible;scrollbar-width:thin}
+.resources{width:100%;border-collapse:collapse;table-layout:fixed}
+.resources th{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:500;text-align:right;padding:8px 10px;border-bottom:1px solid var(--line)}
+.resources th:first-child{text-align:left;width:49%}
+.resources thead th{background:var(--bg)}
+.resources td{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:middle;font-variant-numeric:tabular-nums;text-align:right}
+.resources td:first-child{text-align:left}
+.resources tr.agent{cursor:pointer}
+.resources tr.agent:hover,.resources tr.agent[aria-selected=true]{background:var(--acc-tint)}
+.agent-title{font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.agent-sub{font-size:11px;color:var(--dim);margin-top:3px;overflow-wrap:anywhere}
+td.value{font-size:13px}
+svg.spark{display:block;width:58px;height:15px;margin:4px 0 0 auto}
+.chip{font-size:10px;border:1px solid var(--line);border-radius:999px;padding:1px 6px;font-weight:500;color:var(--dim);display:inline-block;margin-left:5px;vertical-align:1px;cursor:help}
+.chip.hot{color:var(--bad);border-color:var(--bad)}
+.chip.churn,.chip.leak{color:var(--warn);border-color:var(--warn)}
+.inspector{border:1px solid var(--line);border-radius:12px;padding:20px;background:var(--panel);position:sticky;top:16px;min-width:0}
+.inspector-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:13px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+.back{display:none;background:none;border:0;padding:7px 0;color:var(--dim);font-size:12px}
+h2{font:500 27px/1.15 var(--serif);margin:0 0 6px;overflow-wrap:anywhere}
+.identity{font-size:12px;color:var(--dim);overflow-wrap:anywhere}
+.observation{border-left:2px solid var(--line);font:15px/1.45 var(--serif);padding-left:12px;margin:17px 0;overflow-wrap:anywhere}
+.observation.warning{border-left-color:var(--warn)}
+.info-grid{display:flex;gap:22px;flex-wrap:wrap;padding:13px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:11px;color:var(--dim);margin:17px 0}
+.info-grid dt{text-transform:uppercase;letter-spacing:.06em;font-size:10px}
+.info-grid dd{margin:2px 0 0;font-size:18px;font-weight:500;color:var(--fg);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.chart{margin:17px 0}
+.chart-head{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--dim)}
+svg.chart-line{display:block;width:100%;height:90px;margin:7px 0}
+.chart-axis{display:flex;justify-content:space-between;font-size:10px;color:var(--dim)}
+.observed{font-size:12px;color:var(--dim);line-height:1.55;margin:12px 0}
+details{padding:13px 0;border-top:1px solid var(--line)}
+summary{font-size:12px;font-weight:600;min-height:24px}
+details p{font-size:12px;color:var(--dim);margin-top:10px}
+code{font-size:11px;overflow-wrap:anywhere}
+.events{margin:12px 0 0;padding:0;list-style:none;font-size:12px}
+.events li{padding:8px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.events li:last-child{border-bottom:0}
+.events small{display:block;color:var(--dim);margin-top:3px}
+a.event-link{color:var(--dim);font-size:12px;text-decoration:underline;text-underline-offset:2px;overflow-wrap:anywhere}
+a.event-link:hover{color:var(--fg)}
+.tree{margin-top:12px}
+.child{display:flex;justify-content:space-between;gap:12px;padding:7px 0;font-size:11px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+.child:last-child{border-bottom:0}
+.child span:first-child{overflow-wrap:anywhere;min-width:0}
+.child span:last-child{white-space:nowrap;color:var(--dim)}
+.cmd-view{font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:9px 11px;max-height:120px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;scrollbar-width:thin}
+code.hint{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;cursor:copy;overflow-wrap:anywhere}
+code.hint:hover{border-color:var(--accent)}
+.actions{padding-top:15px;border-top:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.actions p{flex:1;min-width:140px;font-size:11px;color:var(--dim)}
+.svc-note{flex:1;min-width:140px;font-size:11px;color:var(--dim)}
+.pill{border:1px solid var(--line);border-radius:999px;padding:9px 14px;font-size:12px;background:transparent;color:var(--fg)}
+.pill.ink{background:var(--accent);color:var(--chipfg);border-color:var(--accent)}
+.pill.mini{padding:5px 13px;font-size:11px}
+.machinery{margin-top:24px;color:var(--dim)}
+#evidence p{margin:0 0 4px}
+.empty{padding:30px 10px;color:var(--dim);font-size:13px}
+dialog{border:1px solid var(--line);border-radius:12px;width:calc(100% - 32px);max-width:450px;max-height:calc(100dvh - 48px);overflow:auto;background:var(--panel);color:var(--fg);padding:24px}
+dialog::backdrop{background:#0007}
+dialog h2{font:500 24px/1.15 var(--serif);margin:0 0 10px}
+dialog p{font:16px/1.45 var(--serif);margin:13px 0}
+dialog .quiet{font:12px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;color:var(--dim)}
+dialog .stop-facts{margin:0;padding:0;list-style:none;font-size:12px}
+dialog .stop-facts li{padding:6px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+dialog .stop-facts li span{color:var(--dim)}
+#stop-error{color:var(--bad)}
+#stop-error:empty{display:none}
+dialog .buttons{display:flex;gap:9px;margin-top:19px;flex-wrap:wrap}
+@media(max-width:760px){
+.page{padding:16px 16px 40px}
+.brand{font-size:18px}
+.intro{margin:20px 0 14px}
+h1{font-size:25px}
+.totals{gap:10px;justify-content:space-between;font-size:11px}
+.workbench,body.detail-open .workbench{display:block;margin-top:16px}
+body.detail-open .workbench{margin-top:18px}
+.filters{flex-wrap:wrap}
+.filters input{font-size:16px;width:100%}
+.filters select{font-size:16px;max-width:144px}
+.filter-row{margin:8px 0}
+.filter-row select{font-size:16px}
+.resources th,.resources td{padding:10px 7px}
+.resources th:first-child{width:56%}
+.resources .children{display:none}
+.agent-title{font-size:13px}
+.agent-sub{font-size:10px}
+td.value{font-size:12px}
+svg.spark{width:45px;height:12px}
+.resources th{font-size:9px}
+#count{display:none}
+.inspector{position:static;padding:18px}
+body.detail-open .list-pane{display:none}
+body.detail-open .intro,body.detail-open .totals{display:none}
+.back{display:block;padding:0}
+.inspector-head{font-size:9px}
+.chip{margin-left:0}
+.agent-title .chip{display:block;width:fit-content;margin:3px 0 0}
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>agent usage manager</h1>
-  <span class="meta" id="meta">loading…</span>
-  <span class="meta" id="err"></span>
-  <span class="cfg" id="cfg"></span>
-</header>
-<div id="stale"></div>
-<div class="wrap">
-<table id="tbl">
-  <thead>
-    <tr>
-      <th>agent</th><th class="c-pid">pid</th><th class="c-status">status</th>
-      <th class="num">cpu %</th><th class="num">mem MB</th>
-      <th class="num gpu">gpu MB</th><th class="num c-up">uptime</th>
-      <th class="c-cmd">command</th><th class="c-act"></th>
-    </tr>
-  </thead>
-</table>
+<main class="page">
+<header class="top" id="topbar"><a class="brand" href="/" aria-label="Agent usage manager home"><i class="mark" aria-hidden="true"></i>Agent usage manager</a><button class="text-button" id="theme">Switch theme</button></header>
+<section class="intro"><h1 id="verdict">Waiting for the agent monitor…</h1><p id="summary">A compact resource scan with an optional process inspector.</p></section>
+<section class="totals" id="numbers" aria-label="Machine and agent resources"></section>
+<div id="health" role="status"></div>
+<div id="stale" role="alert"></div>
+<p id="result" role="status"></p>
+<section class="workbench">
+<div class="list-pane">
+<div class="filters"><input type="search" id="search" aria-label="Find a project, runtime, label, or PID" placeholder="Project, label, or PID"><select id="runtime" aria-label="Filter runtime"><option value="">All runtimes</option></select></div>
+<div class="filter-row"><label><input type="checkbox" id="warnings"> Warnings only <span id="warn-count"></span></label><select id="sort" aria-label="Sort processes"><option value="warning" selected>Warnings, then CPU</option><option value="cpu">CPU</option><option value="mem">Memory</option></select><span class="quiet" id="count"></span></div>
+<div class="table-scroll"><table class="resources"><thead><tr><th>Process</th><th>CPU / core</th><th>RSS</th><th class="children">Children</th></tr></thead><tbody id="agents"></tbody></table></div>
+<p class="empty" id="list-empty" hidden></p>
 </div>
-<div class="empty" id="empty" hidden>No matching agents running.</div>
-
+<aside class="inspector" id="inspector" aria-label="Selected process" hidden></aside>
+</section>
+<details class="machinery" id="monitor"><summary>Monitor details</summary><p id="capture">Waiting for the agent monitor…</p><div id="evidence"></div><details id="event-log" hidden><summary id="event-count">Recent warnings</summary><div id="event-list"></div></details></details>
+</main>
+<dialog id="confirm" aria-labelledby="stop-title"><h2 id="stop-title">Review this process tree.</h2><ul class="stop-facts" id="stop-facts"></ul><div class="cmd-view" id="stop-cmd"></div><p id="stop-method"></p><p class="quiet" id="stop-note"></p><p class="quiet" id="stop-error"></p><div class="buttons"><button class="pill ink" id="do-stop">Stop this tree</button><button class="pill" id="do-force">Force stop instead…</button><button class="pill" id="cancel-stop">Cancel</button></div></dialog>
 <script>
-const tbl = document.getElementById("tbl");
-const meta = document.getElementById("meta");
-const errEl = document.getElementById("err");
-const cfgEl = document.getElementById("cfg");
-const empty = document.getElementById("empty");
-const stale = document.getElementById("stale");
-let lastOk = null;          // timestamp of the last successful /api/agents fetch
-let tokenPath = "";         // where the kill token lives on disk (from /api/agents)
-// A row's identity is pid + create_time: pids get reused, so keying the DOM by
-// pid alone can fold two different agents into one <tbody> (the server pairs
-// them for the same reason — see Agent.create_time).
-const rowKey = x => x.pid + ":" + x.create_time;
-const expanded = new Map(); // row key -> pid, for rows whose subtree is unfolded
-const bodies = new Map();   // row key -> its <tbody> (one tbody per agent: row + children)
-const lastRows = new Map(); // row key -> last-seen agent payload (kill confirm context)
+const $=s=>document.querySelector(s);
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dur=s=>{s=Math.max(0,s|0);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);if(d)return d+"d "+h+"h";if(h)return h+"h "+m+"m";if(m)return m+"m";return s+"s";};
+const day=t=>new Date(t*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+const keyOf=a=>a.pid+":"+a.create_time;
+const runtimeOf=a=>{const r=a.runtime||a.label||"?";return r.charAt(0).toUpperCase()+r.slice(1);};
+const projectOf=a=>a.project||"Unknown directory";
+const labelOf=a=>a.label&&a.label!==a.runtime?a.label:runtimeOf(a);
+const flagName=f=>({hot:"high CPU",idle:"quiet 10m+",churn:"service exits",leak:"memory growth?"}[f]||f||"observation");
+const number=x=>Number.isFinite(x)?x.toLocaleString(undefined,{maximumFractionDigits:1}):"—";
 
-// Reordering rows under the pointer relocates the kill button mid-aim — freeze
-// the ORDER (not the data) while the pointer is over the table.
-let overTable = false;
-tbl.addEventListener("pointerenter", () => { overTable = true; });
-tbl.addEventListener("pointerleave", () => { overTable = false; });
+let data=null,lastFetchOk=0,fetchFail=null,pollTimer=null,refreshPending=null;
+let selectedKey=null,lastSeen=null;
+let eventView=null,eventRequest=0;
+const rowEls=new Map(),openFolds=new Set(),treeCache=new Map(),treePending=new Set();
+let inspectedSnapshot=null,dialogSnap=null,dialogForce=false,pendingStop=false;
+let tokenPath="",hostName="",lastRuntimeKey=null;
+let pointerOver=false,focusWithin=false,resultTimer=null;
 
-// Escape before injecting into innerHTML — cmdlines and launchd labels are
-// host data, and this page has a kill endpoint, so HTML/script injection is a
-// real local-control risk.
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+try{if(window.self!==window.top)$("#topbar").style.display="none";}catch(e){}
+
+const listEl=$("#agents");
+listEl.addEventListener("pointerenter",()=>{pointerOver=true;});
+listEl.addEventListener("pointerleave",()=>{pointerOver=false;});
+listEl.addEventListener("focusin",()=>{focusWithin=true;});
+listEl.addEventListener("focusout",()=>{focusWithin=false;});
+
+function isStale(){
+  if(!data)return true;
+  if(fetchFail)return true;
+  return (Date.now()-lastFetchOk)/1000+(data.sample_age_s||0)>10;
 }
 
-function dur(s) {
-  s = Math.max(0, s|0);
-  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
-        m = Math.floor(s%3600/60);
-  if (d) return d+"d "+h+"h";
-  if (h) return h+"h "+m+"m";
-  if (m) return m+"m";
-  return s+"s";
-}
-
-function spark(trend) {
-  if (!trend || trend.length < 2) return "";
-  const W = 64, H = 14, max = Math.max(100, ...trend);
-  const pts = trend.map((c, i) =>
-    `${(i / (trend.length - 1) * W).toFixed(1)},${(H - 1 - c / max * (H - 2)).toFixed(1)}`
-  ).join(" ");
-  const mins = Math.round(trend.length * 3 / 60);
-  return `<svg class="spark" width="${W}" height="${H}" aria-hidden="true">
-    <title>cpu, last ~${mins || 1} min</title>
-    <line x1="0" y1="${H-1}" x2="${W}" y2="${H-1}"></line>
-    <polyline points="${pts}"></polyline></svg>`;
-}
-
-// Kill needs the X-Kill-Token header. The server NEVER serves the token over
-// HTTP — any process that can curl this page could read it, and the monitored
-// agents are exactly the callers the token exists to stop. So the operator
-// pastes it once (from the 0600 token file the server points at) and it stays
-// in this browser's localStorage, out of reach of same-host curl.
-let hostName = "";           // the SERVER's hostname (from /api/agents)
-function killToken() {
-  let t = localStorage.getItem("killToken");
-  if (!t) {
-    const where = tokenPath || "the server's app-support dir";
-    t = (prompt("First kill from this browser — paste the kill token.\n" +
-                "It's in: " + where +
-                (hostName ? " on " + hostName : "") +
-                (hostName ? "\nFrom this machine: ssh " + hostName +
-                            " cat '" + where + "'" : "") +
-                "\n(Stored in this browser; you won't be asked again.)") || "").trim();
-    if (t) localStorage.setItem("killToken", t);
+function killToken(){
+  let t=localStorage.getItem("killToken");
+  if(!t){
+    const where=tokenPath||"the server's app-support dir";
+    t=(prompt("First stop from this browser — paste the kill token.\n"+
+              "It's in: "+where+
+              (hostName?" on "+hostName:"")+
+              (hostName?"\nFrom this machine: ssh "+hostName+" cat '"+where+"'":"")+
+              "\n(Stored in this browser; you won't be asked again.)")||"").trim();
+    if(t)localStorage.setItem("killToken",t);
   }
   return t;
 }
 
-async function kill(key, force) {
-  const x = lastRows.get(key);
-  if (!x) return;
-  // Plain kill is SIGTERM, but the server auto-escalates survivors to SIGKILL
-  // after 3s — say so, or "kill" reads as graceful-only and a bot trapping
-  // SIGTERM for a state write gets SIGKILLed mid-write while the operator
-  // believes they chose the safe option.
-  const verb = force ? "FORCE KILL (SIGKILL)" : "kill (SIGTERM → SIGKILL after 3s)";
-  const kids = x.child_count > 0
-    ? ` and its ${x.child_count} child process${x.child_count > 1 ? "es" : ""}`
-    : "";
-  // Identify the target by label + command, not just PID: rows in a fleet
-  // share labels, and the PID is the one identifier the operator can't check
-  // against intent.
-  if (!confirm(`${verb} ${x.label} (PID ${x.pid})${kids}?\n${x.cmdline.slice(0, 120)}`)) return;
-  const token = killToken();
-  if (!token) return;
-  try {
-    const r = await fetch(`/api/kill/${x.pid}?force=${force}`,
-                          {method: "POST", headers: {"X-Kill-Token": token}});
-    const j = await r.json();
-    if (r.status === 403 && (j.detail || "").includes("X-Kill-Token")) {
-      // wrong/rotated token — forget it so the next kill re-prompts
+function showResult(ok,text,ms){
+  const el=$("#result");
+  el.className=ok?"ok":"err";
+  el.textContent=text;
+  clearTimeout(resultTimer);
+  resultTimer=setTimeout(()=>{el.textContent="";el.className="";},ms);
+}
+
+function copyText(text,el,done,failed,source=el){
+  const fail=()=>{
+    const prev=el.textContent;
+    el.textContent=failed;
+    setTimeout(()=>{
+      if(!el.isConnected||!source.isConnected)return;
+      el.textContent=prev;
+      const range=document.createRange();
+      range.selectNodeContents(source);
+      const sel=window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    },1500);
+  };
+  try{
+    const w=navigator.clipboard&&navigator.clipboard.writeText(text);
+    if(!w){fail();return;}
+    w.then(()=>{
+      const prev=el.textContent;
+      el.textContent=done;
+      setTimeout(()=>{if(el.isConnected)el.textContent=prev;},1000);
+    }).catch(fail);
+  }catch(e){fail();}
+}
+
+function flagChip(a,now){
+  const f=a.flag;
+  if(f==="hot")return ' <span class="chip hot" title="Mean CPU at least 90% of one core over five minutes. High resource use does not establish runaway work.">high CPU</span>';
+  if(f==="idle")return ' <span class="chip idle" title="Ten-minute p95 CPU below 2% of one core. The process may be waiting; task progress is unknown.">quiet 10m+</span>';
+  if(f==="churn")return ` <span class="chip churn" title="${a.restarts} short-lived exits for this supervised service in the last ten minutes. Check service logs to establish why.">service exits ×${a.restarts}</span>`;
+  if(f==="leak")return ' <span class="chip leak" title="Memory grew at least 30% and 128 MB over fifteen minutes without recovery, sustained for another fifteen minutes. This does not prove a leak.">memory growth?</span>';
+  return "";
+}
+
+function sharedIdentity(a){
+  return !!data&&data.agents.filter(x=>x.runtime===a.runtime&&x.project===a.project&&x.label===a.label).length>1;
+}
+
+function sparkHTML(points){
+  if(!points||points.length<2)return "";
+  const max=Math.max(100,...points);
+  return `<svg class="spark" viewBox="0 0 58 15" role="img" aria-label="Recent CPU trend"><polyline points="${points.map((v,i)=>`${i*58/(points.length-1)},${14-v/max*12}`).join(" ")}" fill="none" stroke="var(--accent)" stroke-width="1.2" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+function rowHTML(a){
+  return `<td><div class="agent-title">${esc(labelOf(a))}${flagChip(a,data.ts)}</div><div class="agent-sub">${esc(a.runtime||runtimeOf(a))} · ${esc(projectOf(a))}<br>PID ${a.pid} · ${dur(a.uptime_s)} old${a.supervised?" · service":""}${sharedIdentity(a)?" · shared name":""}</div></td><td class="value">${number(a.cpu_percent)}%${sparkHTML(a.trend)}</td><td class="value">${Math.round(a.mem_mb)} MB</td><td class="value children">${a.child_count}</td>`;
+}
+
+function matches(a){
+  const q=$("#search").value.trim().toLowerCase(),f=$("#runtime").value;
+  const rootMatch=(projectOf(a)+" "+runtimeOf(a)+" "+(a.label||"")+" "+a.pid).toLowerCase().includes(q);
+  const childMatch=/^\d+$/.test(q)&&(a.child_pids||[]).some(pid=>String(pid)===q);
+  if(q&&!rootMatch&&!childMatch)return false;
+  if($("#warnings").checked&&!a.flag)return false;
+  if(!f)return true;
+  if(f==="supervised")return !!a.supervised;
+  return (a.runtime||a.label)===f;
+}
+
+function syncRuntimeOptions(){
+  const sel=$("#runtime");
+  const runtimes=[...new Set(data.agents.map(a=>a.runtime||a.label).filter(Boolean))].sort();
+  const key=runtimes.join("|");
+  if(key===lastRuntimeKey)return;
+  lastRuntimeKey=key;
+  const cur=sel.value;
+  sel.innerHTML='<option value="">All runtimes</option>'+
+    runtimes.map(r=>`<option value="${esc(r)}">${esc(r.charAt(0).toUpperCase()+r.slice(1))}</option>`).join('')+
+    '<option value="supervised">Supervised</option>';
+  sel.value=[...sel.options].some(o=>o.value===cur)?cur:"";
+}
+
+function renderList(){
+  if(!data)return;
+  syncRuntimeOptions();
+  const byKey=new Map(data.agents.map(a=>[keyOf(a),a]));
+  for(const[k,el]of rowEls)if(!byKey.has(k)){el.remove();rowEls.delete(k);}
+  let shown=0;
+  for(const a of data.agents){
+    const k=keyOf(a);
+    let el=rowEls.get(k);
+    if(!el){
+      el=document.createElement("tr");
+      el.className="agent";
+      el.tabIndex=0;
+      el.addEventListener("click",()=>pick(k));
+      el.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();pick(k);}});
+      rowEls.set(k,el);
+      listEl.appendChild(el);
+    }
+    el.dataset.key=k;
+    el.setAttribute("aria-label",`Inspect ${labelOf(a)}, PID ${a.pid}`);
+    el.setAttribute("aria-selected",k===selectedKey?"true":"false");
+    el.innerHTML=rowHTML(a);
+    const vis=matches(a);
+    el.style.display=vis?"":"none";
+    if(vis)shown++;
+  }
+  const loading=listEl.querySelector(".empty");
+  if(loading)loading.remove();
+  if(!(pointerOver||focusWithin)){
+    const mode=$("#sort").value;
+    const sorted=[...data.agents].sort((p,q)=>(mode==="warning"?Number(!!q.flag)-Number(!!p.flag):0)||(mode==="mem"?q.mem_mb-p.mem_mb:q.cpu_percent-p.cpu_percent)||p.pid-q.pid);
+    sorted.forEach(a=>listEl.appendChild(rowEls.get(keyOf(a))));
+  }
+  $("#count").textContent=shown+" shown";
+  $("#warn-count").textContent="("+data.agents.filter(a=>a.flag).length+")";
+  const emptyEl=$("#list-empty");
+  if(!data.agents.length){
+    emptyEl.hidden=false;
+    emptyEl.textContent="No matching agent processes are running. Monitor details shows the matching configuration.";
+  }else if(!shown){
+    emptyEl.hidden=false;
+    emptyEl.textContent="No processes match this view.";
+  }else emptyEl.hidden=true;
+}
+
+function treeFoldBody(a){
+  const k=keyOf(a);
+  const cached=treeCache.get(k);
+  if(a.child_count===0)return '<p class="quiet" style="margin-top:12px">This process has no children.</p>';
+  if(!cached)return '<p class="quiet" style="margin-top:12px">Loading process tree…</p>';
+  if(cached.error)return `<p class="quiet issue" style="margin-top:12px">Child detail is unavailable: ${esc(cached.error)}</p>`;
+  const children=cached.tree.filter(x=>x.depth>0);
+  if(!children.length)return '<p class="quiet" style="margin-top:12px">No children were captured for this process.</p>';
+  return '<div class="tree">'+children.map(c=>fold(`child-${c.pid}-${c.create_time}`,`${esc(c.name||"?")} · PID ${c.pid} · ${number(c.mem_mb)} MB`, `<p class="quiet">Started ${c.create_time?day(c.create_time):"unknown"} · ${number(c.cpu_percent)}% CPU${c.protected?" · protected from direct signals":""}</p><div class="cmd-view">${esc(c.cmdline||c.name||"")}</div>`)).join('')+'</div>';
+}
+
+async function readJSON(url){
+  const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),8000);
+  try{
+    const r=await fetch(url,{signal:ctrl.signal});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.detail||("HTTP "+r.status));
+    return j;
+  }finally{clearTimeout(timer);}
+}
+
+async function loadTree(key){
+  if(treePending.has(key))return;
+  const a=data&&data.agents.find(x=>keyOf(x)===key);
+  if(!a)return;
+  treePending.add(key);
+  try{
+    const j=await readJSON(`/api/tree/${a.pid}?create_time=${encodeURIComponent(a.create_time)}`);
+    treeCache.set(key,{tree:j.tree||[],history:j.history||[],evidence:j.evidence||null,tree_revision:j.tree_revision,ts:j.ts});
+  }catch(e){
+    treeCache.set(key,{error:e.message});
+  }finally{
+    treePending.delete(key);
+  }
+  if(key===selectedKey&&!eventView)renderInspector();
+}
+
+function fold(name,summary,body){
+  return `<details data-fold="${name}"${openFolds.has(name)?" open":""}><summary>${summary}</summary>${body}</details>`;
+}
+
+function evidenceHTML(e){
+  if(!e)return "";
+  let verdict,rule;
+  if(e.kind==="hot"){
+    verdict=`CPU averaged ${number(e.mean_cpu_percent)}% of one core over five minutes.`;
+    rule=`Warning threshold: ${number(e.threshold_cpu_percent)}% across a full five-minute window. High CPU can also be useful work.`;
+  }else if(e.kind==="leak"){
+    verdict=`Median RSS rose ${number(e.growth_mb)} MB (${number(e.growth_percent)}%) over fifteen minutes and stayed elevated.`;
+    rule=`Median RSS: ${number(e.baseline_mb)} → ${number(e.recent_mb)} MB. Rule: at least +${number(e.min_growth_percent)}% and +${number(e.min_growth_mb)} MB, with no recovery, sustained for ${dur(e.sustained_s)} (minimum ${dur(e.min_sustained_s)}). This is evidence of growth, not a proven leak.`;
+  }else if(e.kind==="idle"){
+    verdict=`Ten-minute p95 CPU was ${number(e.p95_cpu_percent)}% of one core.`;
+    rule=`Quiet threshold: below ${number(e.threshold_cpu_percent)}%. The process may be waiting; CPU observations do not establish task progress.`;
+  }else if(e.kind==="churn"){
+    verdict=`This service had ${number(e.short_lived_exits)} short-lived exits in ten minutes.`;
+    rule=`Warning threshold: ${number(e.threshold_exits)} exits with observed lifetimes under ${dur(e.max_lifetime_s)}. Inspect service logs to establish why.`;
+  }else return "";
+  return `<p class="observation warning">${esc(verdict)}</p><p class="observed">${esc(rule)}<br>Evaluated ${day(e.sampled_at)}${e.samples?` · ${e.samples} observations`:""}</p>`;
+}
+
+function chartHTML(a,metric=a.flag==="leak"?"memory":"cpu",history=null,evidence=a.evidence){
+  const cached=treeCache.get(keyOf(a));
+  let rows=history||cached?.history||[];
+  if(evidence&&((metric==="memory"&&evidence.kind==="leak")||(metric==="cpu"&&["hot","idle"].includes(evidence.kind)))){
+    rows=rows.filter(p=>p[0]<=evidence.sampled_at&&p[0]>=evidence.sampled_at-evidence.window_s);
+  }
+  const title=metric==="memory"?"Memory · tree RSS":"CPU · one core",unit=metric==="memory"?" MB":"%";
+  const points=rows.length?rows.map(p=>p[metric==="memory"?2:1]):metric==="cpu"?(a.trend||[]):[];
+  if(points.length<2)return `<div class="chart"><div class="chart-head"><span>${title}</span><span>${cached?.error?"observations unavailable":cached||history?"not enough observations yet":"loading observations…"}</span></div></div>`;
+  const max=Math.max(metric==="memory"?1:100,...points),span=rows.length?rows[rows.length-1][0]-rows[0][0]:0;
+  const poly=points.map((v,i)=>`${span?(rows[i][0]-rows[0][0])*400/span:i*400/Math.max(1,points.length-1)},${58-v/max*50}`).join(" ");
+  return `<div class="chart"><div class="chart-head"><span>${title}</span><span>0–${number(Math.ceil(max))}${unit}</span></div><svg class="chart-line" viewBox="0 0 400 65" preserveAspectRatio="none" role="img" aria-label="${title}: ${points.length} observations"><path d="M0 60H400" stroke="var(--line)"/><polyline points="${poly}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg><div class="chart-axis"><span>${rows.length?day(rows[0][0]):"Earlier"}</span><span>${rows.length?day(rows[rows.length-1][0]):"Latest"}</span></div></div>`;
+}
+
+function replacePanel(el,html,preserve=true){
+  const active=preserve&&el.contains(document.activeElement)?document.activeElement:null;
+  const focusId=active&&active.id;
+  const focusFold=active&&active.tagName==="SUMMARY"?active.parentElement.dataset.fold:null;
+  const folds=new Map(preserve?[...el.querySelectorAll("details[data-fold]")].map(d=>[d.dataset.fold,d.open]):[]);
+  const command=preserve&&el.querySelector(".cmd-view");
+  const scroll=command?{top:command.scrollTop,left:command.scrollLeft}:null;
+  el.innerHTML=html;
+  el.querySelectorAll("details[data-fold]").forEach(d=>{
+    if(folds.has(d.dataset.fold))d.open=folds.get(d.dataset.fold);
+  });
+  const target=focusId?el.querySelector("#"+focusId):focusFold?el.querySelector(`details[data-fold="${focusFold}"] > summary`):null;
+  if(target&&!target.disabled)target.focus({preventScroll:true});
+  const current=scroll&&el.querySelector(".cmd-view");
+  if(current){current.scrollTop=scroll.top;current.scrollLeft=scroll.left;}
+}
+
+function renderInspector(){
+  const el=$("#inspector");
+  const viewKey=eventView?"event:"+eventView.id:selectedKey;
+  const preserve=el.dataset.key===viewKey;
+  if(preserve&&String(window.getSelection&&window.getSelection()||"").length)return;
+  inspectedSnapshot=null;
+  el.dataset.key=viewKey||"";
+  el.hidden=!viewKey;
+  document.body.classList.toggle("detail-open",!!viewKey);
+  if(!viewKey){el.innerHTML="";return;}
+  if(eventView){renderEvent(el,preserve);return;}
+  const a=data&&data.agents.find(x=>keyOf(x)===selectedKey);
+  if(!a){
+    const s=lastSeen;
+    replacePanel(el,`${inspectorHead(s?"Process · "+s.pid:"Process")}<h2>${data?"This process is no longer listed.":"Waiting for the process snapshot."}</h2><p class="identity">${s?"PID "+s.pid+" · started "+day(s.create_time):""}</p><p class="observation">${data?"This exact process identity is absent from the latest snapshot. It may have exited or stopped matching the configuration. This link will not select another process with the same PID.":"The monitor has not supplied a current snapshot. Stop is unavailable."}</p>${s&&Number.isFinite(s.mem_mb)?`<dl class="info-grid"><div><dt>Last known tree memory</dt><dd>${number(s.mem_mb)} MB</dd></div><div><dt>Last known CPU</dt><dd>${number(s.cpu_percent)}%</dd></div></dl>`:""}`,preserve);
+    wireBack();
+    return;
+  }
+  lastSeen=a;
+  const cached=treeCache.get(keyOf(a));
+  const reviewSnapshot={...a,key:keyOf(a),tree_revision:a.tree_revision===undefined?undefined:cached?.tree_revision??null};
+  const reviewProblem=stopProblem(reviewSnapshot);
+  const supLine=a.supervised
+    ?`Managed by launchd · job ${esc(a.supervised)}${a.username?" · as "+esc(a.username):""}`
+    :`${esc(a.label)} · independently launched${a.username?" · as "+esc(a.username):""}`;
+  const restart=a.supervised&&a.restarts
+    ?`${a.restarts} short-lived service exits (10m)${a.last_restart?" · last "+dur(data.ts-a.last_restart)+" ago":""}`
+    :"Not established";
+  const gpu=a.gpu_mem_mb!=null?`<div><dt>GPU memory</dt><dd>${Math.round(a.gpu_mem_mb)} MB</dd></div>`:"";
+  const source={tmux:"tmux session label",launchd:"launchd service label",matcher:"runtime matcher label"}[a.label_source]||"label source unavailable";
+  let actions;
+  if(a.supervised){
+    const why=a.keepalive===true
+      ?"A signal won't stick — launchd respawns this job (KeepAlive)."
+      :a.keepalive===false
+        ?"A signal stops it now, but launchd restarts it at next login (RunAtLoad)."
+        :"launchd may restart this service after it stops.";
+    actions=`<div class="actions"><p class="svc-note">Supervised by launchd — stop it with the service command, not a signal from here. ${why} Supervised restarts are short-lived service exits, not proof of a crash loop.</p>${a.stop_hint?`<code class="hint" id="svc-hint" title="Click to copy the service stop command. This page never runs it.">${esc(a.stop_hint)}</code>`:'<p class="quiet">No service stop command was supplied.</p>'}</div>`;
+  }else if(a.protected){
+    actions='<div class="actions"><button class="pill ink" disabled>Stop unavailable</button><p>Protected process — the monitor refuses to stop it.</p></div>';
+  }else{
+    actions=`<div class="actions"><button class="pill ink" id="review-stop"${reviewProblem||pendingStop?" disabled":""}>Review stop…</button><p>${reviewProblem?esc(reviewProblem):`Reviews the root identity and ${a.child_count} observed child process${a.child_count===1?"":"es"} before signaling.`}</p></div>`;
+  }
+  replacePanel(el,`${inspectorHead("Process · "+a.pid)}<h2>${esc(labelOf(a))}${flagChip(a,data.ts)}</h2><p class="identity">${esc(runtimeOf(a))} · working directory: ${esc(projectOf(a))}<br>Started ${day(a.create_time)} · ${source}</p>${sharedIdentity(a)?'<p class="observation">This name is shared by another process. The directory does not identify a unique task.</p>':!a.evidence?'<p class="observation">This is a process tree. Task progress and conversation identity are not available.</p>':""}<dl class="info-grid"><div><dt>Tree RSS</dt><dd>${Math.round(a.mem_mb)} MB</dd></div><div><dt>CPU / core</dt><dd>${number(a.cpu_percent)}%</dd></div><div><dt>Children</dt><dd>${a.child_count}</dd></div>${gpu}</dl>${evidenceHTML(a.evidence)}${chartHTML(a)}${fold("resource",a.flag==="leak"?"CPU observations":"Memory observations",chartHTML(a,a.flag==="leak"?"cpu":"memory"))}${fold("tree",`Processes in this tree · ${a.child_count} children`,treeFoldBody(a))}${fold("command","Command excerpt",`<div class="cmd-view">${esc(a.cmdline||a.name||"")}</div><p class="quiet">Redacted; limited to the first 300 characters.</p><button class="pill mini" id="copy-cmd">Copy displayed command</button>`)}${fold("evidence","Observation details",`<ul class="events"><li>${supLine}</li><li>OS process state<small>${esc(a.status||"unknown")} · task progress unavailable</small></li><li>Service restart evidence<small>${restart}</small></li><li>Identity key<small>${esc(keyOf(a))}${a.instance_id?" · instance "+esc(a.instance_id):""}</small></li><li>Resource sample captured<small>${day(data.ts)} · host ${esc(data.host||"")}</small></li>${(a.evidence?.exit_timestamps||[]).map(t=>`<li>Observed short-lived service exit<small>${day(t)}</small></li>`).join("")}${a.event_id?`<li><a class="event-link" data-event="${esc(a.event_id)}" href="/?event=${encodeURIComponent(a.event_id)}">Inspect the warning's first observation ›</a></li>`:""}</ul>`)}${actions}`,preserve);
+  inspectedSnapshot=reviewSnapshot;
+  wireBack();
+  el.querySelectorAll("details[data-fold]").forEach(d=>{
+    d.addEventListener("toggle",()=>{
+      if(!d.isConnected)return;
+      const name=d.dataset.fold;
+      if(d.open){openFolds.add(name);if(name==="tree"&&!treeCache.has(selectedKey))loadTree(selectedKey);}
+      else openFolds.delete(name);
+    });
+  });
+  const hint=$("#svc-hint");
+  if(hint)hint.addEventListener("click",()=>copyText(a.stop_hint,hint,"copied ✓","copy failed — press ⌘C"));
+  const cc=$("#copy-cmd");
+  if(cc)cc.addEventListener("click",()=>copyText(a.cmdline||a.name||"",cc,"copied ✓","copy failed — select the command",cc.parentElement.querySelector(".cmd-view")));
+  const rs=$("#review-stop");
+  if(rs)rs.addEventListener("click",()=>openStop(reviewSnapshot));
+  wireEventLinks(el);
+}
+
+function inspectorHead(text){
+  return `<div class="inspector-head"><button class="back text-button" id="back">‹ All processes</button><span class="smallcaps">${esc(text)}</span><button class="text-button" id="close-inspector">Close</button></div>`;
+}
+
+function wireBack(){
+  for(const id of ["back","close-inspector"]){const b=$("#"+id);if(b)b.addEventListener("click",closeInspector);}
+}
+
+function closeInspector(){
+  const previous=selectedKey;
+  selectedKey=null;lastSeen=null;eventView=null;eventRequest++;openFolds.clear();
+  setRoute({});renderList();renderInspector();
+  const row=rowEls.get(previous);
+  if(row&&row.style.display!=="none")row.focus({preventScroll:true});
+  if(matchMedia("(max-width:760px)").matches)document.querySelector(".list-pane").scrollIntoView({block:"start"});
+}
+
+function pick(key,navigate=true){
+  if(key!==selectedKey){openFolds.clear();}
+  eventView=null;eventRequest++;
+  selectedKey=key;
+  const a=data&&data.agents.find(x=>keyOf(x)===key);
+  if(a){lastSeen=a;if(navigate)setRoute({pid:a.pid,create_time:a.create_time});}
+  renderList();
+  renderInspector();
+  loadTree(key);
+  if(matchMedia("(max-width:760px)").matches)$("#inspector").scrollIntoView({block:"start"});
+}
+
+function setRoute(values){
+  const url=new URL(window.location.href);
+  for(const name of ["event","pid","create_time"])url.searchParams.delete(name);
+  for(const[name,value]of Object.entries(values))url.searchParams.set(name,String(value));
+  if(url.href!==window.location.href)window.history.pushState(null,"",url);
+}
+
+function readRoute(){
+  const params=new URLSearchParams(window.location.search);
+  if(params.has("event")){openObservation(params.get("event"),false);return;}
+  eventRequest++;eventView=null;selectedKey=null;lastSeen=null;openFolds.clear();
+  if(params.has("pid")||params.has("create_time")){
+    const pid=Number(params.get("pid")),ct=Number(params.get("create_time"));
+    if(!Number.isSafeInteger(pid)||pid<=0||!Number.isFinite(ct)||ct<=0){
+      eventView={id:"invalid-process",error:"This process link is incomplete. It must include the PID and its creation time."};
+    }else{
+      lastSeen={pid,create_time:ct};selectedKey=keyOf(lastSeen);
+      if(data)loadTree(selectedKey);
+    }
+  }
+  renderList();renderInspector();
+}
+
+function wireEventLinks(el){
+  el.querySelectorAll("a[data-event]").forEach(link=>link.addEventListener("click",e=>{
+    if(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
+    e.preventDefault();openObservation(link.dataset.event);
+  }));
+}
+
+async function openObservation(id,navigate=true){
+  const request=++eventRequest;
+  selectedKey=null;lastSeen=null;openFolds.clear();
+  eventView={id,loading:true};
+  if(navigate)setRoute({event:id});
+  if(!/^[a-f0-9]{24}$/.test(id||""))eventView={id:id||"invalid",error:"This observation link is invalid. Open a recent warning from Monitor details."};
+  renderList();renderInspector();
+  if(!eventView.loading)return;
+  if(matchMedia("(max-width:760px)").matches)$("#inspector").scrollIntoView({block:"start"});
+  try{
+    const record=await readJSON("/api/events/"+encodeURIComponent(id));
+    if(request===eventRequest)eventView={id,record};
+  }catch(e){
+    if(request===eventRequest)eventView={id,error:e.name==="AbortError"?"The observation request timed out. Reopen the link to retry.":e.message};
+  }
+  if(request===eventRequest)renderInspector();
+}
+
+function observationStatus(e){
+  if(e.status==="cleared")return "Warning cleared"+(e.ended_at?" · "+day(e.ended_at):"");
+  if(e.status==="not_observed")return "Process no longer observed"+(e.ended_at?" · "+day(e.ended_at):"");
+  return "Flag present at last observation · "+day(e.last_observed_at);
+}
+
+function renderEvent(el,preserve){
+  const view=eventView;
+  if(view.loading||view.error){
+    replacePanel(el,`${inspectorHead("Saved observation")}<h2>${view.error?"Observation unavailable.":"Loading the warning observation…"}</h2><p class="identity">${view.error?esc(view.error):"Retrieving the measurements recorded when the flag first appeared."}</p><p class="observed">Warning history lasts at most 48 hours and clears when the monitor restarts. No process action is available from this view.</p>`,preserve);
+    wireBack();return;
+  }
+  const e={...view.record,...(data?.events||[]).find(x=>x.id===view.id)},a=e.agent;
+  const current=data&&data.agents.find(x=>keyOf(x)===keyOf(a));
+  replacePanel(el,`${inspectorHead("Saved warning · "+day(e.observed_at))}<h2>${esc(labelOf(a))}${flagChip(a,e.observed_at)}</h2><p class="identity">${esc(runtimeOf(a))} · ${esc(projectOf(a))}<br>PID ${a.pid} · started ${day(a.create_time)}<br>${esc(observationStatus(e))}</p><dl class="info-grid"><div><dt>RSS at warning</dt><dd>${number(a.mem_mb)} MB</dd></div><div><dt>CPU / core</dt><dd>${number(a.cpu_percent)}%</dd></div><div><dt>Children then</dt><dd>${a.child_count}</dd></div></dl>${evidenceHTML(a.evidence)}${chartHTML(a,a.flag==="leak"?"memory":"cpu",e.history)}${fold("resource",a.flag==="leak"?"CPU observations":"Memory observations",chartHTML(a,a.flag==="leak"?"cpu":"memory",e.history))}${fold("evidence","Observation details",`<ul class="events"><li>Recorded ${day(e.observed_at)} on ${esc(e.host||"this host")}</li><li>Retained until at most ${day(e.retained_until ?? e.observed_at+3600)} while the monitor stays running.</li><li>Identity<small>${esc(keyOf(a))}</small></li>${(a.evidence?.exit_timestamps||[]).map(t=>`<li>Observed short-lived service exit<small>${day(t)}</small></li>`).join("")}</ul>`)}<div class="actions">${current?'<button class="pill" id="inspect-current">Inspect current process ›</button>':""}<p>This is a saved observation. ${current?"Review the current process and tree before any stop.":"The exact process is not in the current snapshot. This view will not select a replacement PID."}</p></div>`,preserve);
+  wireBack();
+  const button=$("#inspect-current");
+  if(button&&current)button.addEventListener("click",()=>pick(keyOf(current)));
+}
+
+function openStop(a){
+  if(stopProblem({...a,key:keyOf(a)}))return;
+  dialogSnap={...a,key:keyOf(a)};
+  dialogForce=false;
+  drawStopDialog();
+  $("#stop-error").textContent="";
+  $("#confirm").showModal();
+  renderStale();
+}
+
+function drawStopDialog(){
+  const s=dialogSnap;
+  $("#stop-title").textContent=dialogForce?"Force-stop this process tree?":"Review this process tree.";
+  $("#stop-facts").innerHTML=`<li><span>Process</span> · ${esc(runtimeOf(s))} in ${esc(projectOf(s))} · label ${esc(s.label)}</li><li><span>PID</span> · ${s.pid}</li><li><span>Started</span> · ${day(s.create_time)} (create_time ${s.create_time})</li><li><span>Captured children</span> · ${s.child_count} process${s.child_count===1?"":"es"} observed</li><li><span>Tree memory</span> · ≈ ${Math.round(s.mem_mb)} MB</li>`;
+  $("#stop-cmd").textContent=s.cmdline||s.name||"";
+  $("#stop-method").textContent=dialogForce
+    ?"Force stop sends SIGKILL to the root and captured children immediately. Protected processes are skipped. Work may be interrupted without cleanup."
+    :"Stop sends SIGTERM to the root and captured children, skipping protected processes. Signaled processes still running after 3 seconds receive SIGKILL.";
+  $("#stop-note").textContent=s.tree_revision
+    ?"This interrupts work hosted under the root. Process identities are checked again before signaling; a changed tree requires a fresh review. Processes born afterward may survive."
+    :"This interrupts work hosted under the root. The server checks the root creation time but does not support child-scope confirmation. Nothing is signaled until you confirm.";
+  const ink=$("#do-stop");
+  ink.textContent=dialogForce?"Force stop (SIGKILL)":"Stop this tree";
+  $("#do-force").textContent=dialogForce?"‹ Back to plain stop":"Force stop instead…";
+  $("#stop-error").textContent="";
+}
+
+function stopDialogError(msg){
+  $("#stop-error").textContent=msg;
+  $("#do-stop").disabled=true;
+  $("#do-force").disabled=true;
+}
+
+async function executeStop(){
+  if(pendingStop||!dialogSnap)return;
+  if(isStale()){stopDialogError("The data on screen is stale — stop is disabled until the monitor responds again.");return;}
+  const cur=data&&data.agents.find(x=>keyOf(x)===dialogSnap.key);
+  if(!cur){stopDialogError("This process is no longer in the current snapshot. Close this review and select again.");return;}
+  const token=killToken();
+  if(!token)return;
+  const problem=stopProblem(dialogSnap);
+  if(problem){stopDialogError(problem);return;}
+  pendingStop=true;
+  const ink=$("#do-stop");
+  ink.disabled=true;$("#do-force").disabled=true;$("#cancel-stop").disabled=true;
+  ink.textContent="Stopping…";
+  try{
+    const scope=dialogSnap.tree_revision?`&tree_revision=${encodeURIComponent(dialogSnap.tree_revision)}`:"";
+    const r=await fetch(`/api/kill/${dialogSnap.pid}?force=${dialogForce}&create_time=${encodeURIComponent(dialogSnap.create_time)}${scope}`,{method:"POST",headers:{"X-Kill-Token":token}});
+    const j=await r.json();
+    if(r.status===403&&(j.detail||"").includes("X-Kill-Token")){
       localStorage.removeItem("killToken");
       throw new Error("kill token rejected (rotated?) — you'll be asked to paste it again");
     }
-    if (!r.ok) throw new Error(j.detail || r.status);
-    if (j.still_running === 0 && (j.killed > 0 || j.result === "already exited")) {
-      errEl.className = "meta ok";
-      errEl.textContent = `✓ ${j.result} (${j.killed} process${j.killed===1?"":"es"})`;
-      setTimeout(() => { errEl.textContent = ""; errEl.className = "meta"; }, 4000);
-    } else {
-      // partial failure — same auto-clear as the ✓ path, with a longer dwell
-      // (an error needs more reading time), so it can't stick around forever.
-      errEl.className = "meta err";
-      errEl.textContent = `✗ ${j.result} — ${j.killed} killed, ${j.still_running} still running`;
-      setTimeout(() => { errEl.textContent = ""; errEl.className = "meta"; }, 8000);
+    if(!r.ok)throw new Error(j.detail||("HTTP "+r.status));
+    $("#confirm").close();
+    if(j.still_running===0&&!j.skipped_count&&(j.killed>0||j.result==="already exited")){
+      showResult(true,`✓ ${j.result} — ${j.killed} process${j.killed===1?"":"es"} stopped.`,12000);
+    }else{
+      showResult(false,`${j.killed} stopped, ${j.skipped_count||0} skipped, ${j.still_running} signaled processes still running. ${j.result}.`,20000);
     }
-    await refresh();
-  } catch (e) { errEl.className = "meta err"; errEl.textContent = "kill failed: " + e.message; }
+    await refreshNow();
+  }catch(e){
+    showResult(false,"Stop failed: "+e.message,20000);
+    $("#confirm").close();
+  }finally{
+    pendingStop=false;
+    ink.disabled=false;$("#do-force").disabled=false;$("#cancel-stop").disabled=false;
+  }
 }
 
-function copyHint(el) {
-  // A denied clipboard write (permission prompt dismissed, unfocused document,
-  // no clipboard API) must not fail silently — the operator would walk away
-  // believing they hold a bootout command they don't have. Say so, then select
-  // the chip text so a manual ⌘C still works (an active selection also pauses
-  // auto-refresh — see refresh() — so the re-render can't yank it mid-copy).
-  const fail = () => {
-    const prev = el.textContent;
-    el.textContent = "copy failed — press ⌘C";
-    setTimeout(() => {
-      // a refresh() re-render may have replaced the row mid-flash
-      if (!el.isConnected) return;
-      el.textContent = prev;
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
-    }, 1500);
-  };
-  try {
-    const w = navigator.clipboard && navigator.clipboard.writeText(el.textContent);
-    if (!w) { fail(); return; }
-    w.then(() => {
-      const prev = el.textContent;
-      el.textContent = "copied ✓";
-      setTimeout(() => { el.textContent = prev; }, 1000);
-    }).catch(fail);
-  } catch (e) { fail(); }
+function renderTop(){
+  const a=data.agents;
+  const totCpu=a.reduce((s,x)=>s+x.cpu_percent,0);
+  const totMem=a.reduce((s,x)=>s+x.mem_mb,0);
+  $("#capture").textContent=`Live sample · ${data.host||"this host"} · ${data.cpu_count||"?"} cores · ${day(data.ts)}`;
+  const flagged=a.filter(x=>x.flag).length;
+  $("#verdict").textContent=flagged?(flagged===1?"One process is flagged.":`${flagged} processes are flagged.`):"No resource warnings in this sample.";
+  $("#summary").textContent=`${a.length} process tree${a.length===1?"":"s"} · compare resources, then inspect a process.`;
+  const nums=$("#numbers");
+  nums.hidden=false;
+  nums.innerHTML=`<span><strong>${(totMem/1024).toFixed(1)} GB</strong> tracked RSS</span><span><strong>${data.cpu_count?(totCpu/data.cpu_count).toFixed(0):"0"}%</strong> CPU capacity</span><span><strong>${Math.round(data.mem_used_pct||0)}%</strong> host memory</span>`;
+  document.title=a.length?`${a.length} agent${a.length===1?"":"s"} · ${totCpu.toFixed(0)}% cpu`:"agent usage manager";
 }
 
-function childRows(tree) {
-  return tree.filter(c => c.depth > 0).map(c => `<tr class="child">
-    <td style="padding-left:${12 + c.depth * 14}px">↳ ${esc(c.name)}</td>
-    <td class="c-pid">${c.pid}</td><td class="c-status"></td>
-    <td class="num">${c.cpu_percent.toFixed(1)}<span class="unit">%</span></td>
-    <td class="num">${c.mem_mb.toFixed(0)}<span class="unit"> MB</span></td>
-    <td class="num gpu"></td><td class="num c-up"></td>
-    <td class="cmd c-cmd" title="${esc(c.cmdline)}">${esc(c.cmdline)}</td><td class="c-act"></td>
-  </tr>`).join("");
+function renderEvidence(){
+  const parts=[];
+  const health=[];
+  let machinery="";
+  if(data.config_error){
+    parts.push(`<span class="issue err">Config error — running on the last good config: ${esc(data.config_error)}</span>`);
+    health.push("The matching configuration has an error; the monitor is using its last good configuration. See Monitor details.");
+  }
+  const warnings=Array.isArray(data.config_warnings)?data.config_warnings:[];
+  if(warnings.length){
+    machinery+=`<details class="machinery" data-fold="config"><summary>${warnings.length} config warning${warnings.length===1?"":"s"}</summary><ul class="events">${warnings.map(w=>`<li>${esc(w)}</li>`).join("")}</ul></details>`;
+  }
+  for(const x of data.runtime_exits||[]){
+    if(!x.short_lived_exits)continue;
+    parts.push(`${x.short_lived_exits} short-lived ${esc(x.runtime)} exits were recorded across the runtime in the last 10 minutes${x.last_exit?` (last ${dur(data.ts-x.last_exit)} ago)`:""}. That is a runtime-level fact — not evidence that any single session shown here restarted.`);
+  }
+  const bad=(data.alert_deliveries||[]).filter(x=>["retry","failed","unconfirmed"].includes(x.status));
+  if(bad.length){
+    const word=bad.some(x=>x.status!=="retry")?"failed or unconfirmed":"awaiting retry";
+    parts.push(`<span class="issue">${bad.length} alert deliver${bad.length===1?"y":"ies"} ${word}.</span>`);
+    health.push(`${bad.length} alert deliver${bad.length===1?"y":"ies"} ${word}. See Monitor details.`);
+    machinery+=`<details class="machinery" data-fold="alerts"><summary>Alert delivery detail</summary><ul class="events">${bad.map(x=>`<li>${esc(x.label||x.instance_id||"?")} · ${esc(x.flag||"")} · ${esc(x.status)}<small>${x.attempts} attempt${x.attempts===1?"":"s"}${x.next_retry_at?" · next retry "+day(x.next_retry_at):""}${x.error?" · "+esc(x.error):""}</small></li>`).join("")}</ul></details>`;
+  }
+  if(!parts.length&&!machinery){
+    parts.push(`Config: ${esc(data.config_path||"unknown")} (edits hot-reload). OS liveness alone does not establish task progress.`);
+  }else if(!data.config_error){
+    parts.push(`<span class="quiet">Config: ${esc(data.config_path||"unknown")} (edits hot-reload).</span>`);
+  }
+  replacePanel($("#evidence"),parts.map(p=>`<p style="margin:0 0 4px">${p}</p>`).join("")+machinery);
+  $("#health").textContent=health.join(" ");
+  const events=data.events||[];
+  $("#event-log").hidden=!events.length;
+  $("#event-count").textContent=`Recent warnings · ${events.length}`;
+  replacePanel($("#event-list"),'<p class="quiet">Up to 100 warning observations for 48 hours; cleared when the monitor restarts.</p><ul class="events">'+events.map(e=>`<li><a class="event-link" id="event-${esc(e.id)}" data-event="${esc(e.id)}" href="/?event=${encodeURIComponent(e.id)}">${esc(e.label)} · ${esc(flagName(e.flag))} ›</a><small>${day(e.observed_at)} · ${esc(observationStatus(e))}</small></li>`).join("")+'</ul>');
+  wireEventLinks($("#event-list"));
 }
 
-async function toggleTree(pid, key) {
-  if (expanded.has(key)) { expanded.delete(key); renderTree(key, null); return; }
-  expanded.set(key, pid);
-  await loadTree(pid, key);
+function stopProblem(snapshot){
+  if(isStale())return "The data is stale. Stop is disabled until the monitor responds again.";
+  const current=data.agents.find(a=>keyOf(a)===snapshot.key);
+  if(!current)return "This process is no longer in the current snapshot. Close this review and select again.";
+  if(current.protected)return "This process is protected. Stop is unavailable.";
+  if(current.supervised)return "This process is supervised. Use its service stop command.";
+  if(current.tree_revision===null)return "Some process identities could not be read. Stop is unavailable.";
+  if(snapshot.tree_revision===null)return "Current process-tree details are unavailable. Wait for them to refresh before reviewing a stop.";
+  if(snapshot.tree_revision&&current.tree_revision!==snapshot.tree_revision)return "The process tree changed. Close this review and inspect its current scope.";
+  return "";
 }
 
-async function loadTree(pid, key) {
-  try {
-    const r = await fetch(`/api/tree/${pid}`);
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    renderTree(key, (await r.json()).tree);
-  } catch (e) { expanded.delete(key); }
+function renderStale(){
+  const stale=isStale();
+  document.body.classList.toggle("stale",stale&&!!data);
+  const review=$("#review-stop");
+  if(review)review.disabled=pendingStop||!inspectedSnapshot||!!stopProblem(inspectedSnapshot);
+  if($("#confirm").open&&dialogSnap&&!pendingStop){
+    const problem=stopProblem(dialogSnap);
+    $("#do-stop").disabled=!!problem;
+    $("#do-force").disabled=!!problem;
+    $("#stop-error").textContent=problem;
+  }
+  const el=$("#stale");
+  if(stale&&data){
+    const last=lastFetchOk?new Date(lastFetchOk).toLocaleTimeString():"never";
+    el.textContent=fetchFail
+      ?`⚠ Disconnected from the agent monitor (${fetchFail}) — showing the last good sample from ${last}. Stop actions are disabled.`
+      :`⚠ The latest sample is more than 10 seconds old — treat this data as stale. Stop actions are disabled.`;
+  }
 }
 
-function renderTree(key, tree) {
-  const tb = bodies.get(key);
-  if (!tb) return;
-  tb.querySelectorAll("tr.child").forEach(tr => tr.remove());
-  if (tree) tb.firstElementChild.insertAdjacentHTML("afterend", childRows(tree));
-}
-
-function rowHTML(x, cpus, now) {
-  const key = rowKey(x);
-  const protectedNote = x.protected ? ' title="protected — cannot be killed"' : "";
-  const kids = x.child_count > 0
-    ? ` <span class="kids" title="${x.child_count} child process(es) — CPU/mem/GPU are tree totals; kill stops the whole tree. Click to ${expanded.has(key) ? "collapse" : "expand"}." onclick="toggleTree(${x.pid}, '${key}')">${expanded.has(key) ? "−" : "+"}${x.child_count}</span>`
-    : "";
-  // Word the supervision note the way the server does on the kill path: only a
-  // KeepAlive job truly can't be stopped by a signal — a RunAtLoad-only job
-  // dies fine, it just comes back at next login. Never over-claim.
-  const svcWhy = x.keepalive
-    ? "A signal won't stick — launchd respawns it (KeepAlive)."
-    : "A signal stops it now but launchd restarts it at next login (RunAtLoad).";
-  const svc = x.supervised
-    ? ` <span class="svc" title="Supervised by launchd (job '${esc(x.supervised)}'). ${svcWhy} Use the launchctl command on the right.">launchd</span>`
-    : "";
-  const flag = x.flag === "hot"
-    ? ` <span class="flag hot" title="CPU pegged ≥90% of a core for 5+ minutes — runaway?">hot 5m+</span>`
-    : x.flag === "idle"
-      ? ` <span class="flag idle" title="No CPU activity for 10+ minutes — wedged, or just waiting?">idle 10m+</span>`
-      : x.flag === "churn"
-        ? ` <span class="flag churn" title="${x.restarts} short-lived restarts in the last 10 minutes — crash-looping under a supervisor?">churn ×${x.restarts}${x.last_restart?` · restarted ${dur(now-x.last_restart)} ago`:""}</span>`
-        : x.flag === "leak"
-          ? ` <span class="flag leak" title="Memory up ≥30% (and ≥128 MB) over 15 minutes without coming back down — leak?">leak?</span>`
-          : "";
-  // launchd-supervised jobs are stopped via launchctl, not a signal (a
-  // KeepAlive job would just respawn); show the real command (click to copy)
-  // instead of dead-end kill buttons.
-  const actions = x.supervised
-    ? `<code class="hint" title="click to copy" onclick="copyHint(this)">${esc(x.stop_hint)}</code>`
-    : `<button class="kill" ${x.protected?'disabled':''}${protectedNote}
-        title="SIGTERM; anything still up after 3s gets SIGKILL"
-        onclick="kill('${key}', false)">kill</button>
-      <button class="kill ghost" ${x.protected?'disabled':''}
-        title="SIGKILL — forceful, no cleanup. Use only if plain kill won't stop it."
-        onclick="kill('${key}', true)">force</button>`;
-  return `<tr>
-    <td><span class="label">${esc(x.label)}</span>${svc}${flag}${kids}</td>
-    <td class="c-pid">${x.pid}</td>
-    <td class="c-status"><span class="dot ${x.alive?'live':'dead'}"></span>${esc(x.status)}</td>
-    <td class="num" title="${x.cpu_percent.toFixed(0)}% of one core · ${(x.cpu_percent/cpus).toFixed(0)}% of all ${cpus} cores">${x.cpu_percent.toFixed(1)}<span class="unit">%</span>${spark(x.trend)}</td>
-    <td class="num">${x.mem_mb.toFixed(0)}<span class="unit"> MB</span></td>
-    <td class="num gpu">${x.gpu_mem_mb==null?'—':x.gpu_mem_mb.toFixed(0)}</td>
-    <td class="num c-up">${dur(x.uptime_s)}</td>
-    <td class="cmd c-cmd" title="${esc(x.cmdline)}">${esc(x.cmdline)}</td>
-    <td class="c-act">${actions}</td>
-  </tr>`;
-}
-
-async function refresh() {
-  // Don't re-render mid-selection — it would yank a command/launchctl hint the
-  // user is in the middle of copying.
-  if (String(window.getSelection?.() || "").length) return;
-  let data;
-  try {
-    const r = await fetch("/api/agents");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    data = await r.json();
-    // recovered → clear the stale state and any prior fetch error
-    document.body.classList.remove("stale");
-    if (errEl.textContent.startsWith("fetch failed")) errEl.textContent = "";
-  } catch (e) {
-    // Don't blank the table — keep showing the last good data, but mark it
-    // untrusted so nobody kills based on a frozen view.
-    document.body.classList.add("stale");
-    const last = lastOk ? " · last update " + lastOk.toLocaleTimeString() : "";
-    stale.textContent = "⚠ disconnected from the agent monitor — data below may be stale" + last;
-    errEl.className = "meta err";
-    errEl.textContent = "fetch failed: " + e.message;
+function render(){
+  renderStale();
+  if(!data){
+    if(fetchFail){
+      $("#list-empty").hidden=false;
+      $("#list-empty").textContent=`Could not reach the agent monitor: ${fetchFail}. Retrying every three seconds.`;
+      $("#capture").textContent="Waiting for the agent monitor…";
+      $("#verdict").textContent="The monitor is unavailable.";
+    }
     return;
   }
-  lastOk = new Date();
-  tokenPath = data.token_path || tokenPath;
-  hostName = data.host || hostName;
-
-  const a = data.agents;
-  const totCpu = a.reduce((s, x) => s + x.cpu_percent, 0);
-  const totMem = a.reduce((s, x) => s + x.mem_mb, 0);
-  const load = a.length
-    ? ` · Σ ${totCpu.toFixed(0)}% cpu, ${(totMem/1024).toFixed(1)} GB`
-    : "";
-  const ram = data.mem_total_mb
-    ? ` · ram ${data.mem_used_pct.toFixed(0)}%`
-    : "";
-  // The 2-second "what's wrong": flag counts right in the header stats.
-  const nFlag = {};
-  for (const x of a) if (x.flag) nFlag[x.flag] = (nFlag[x.flag] || 0) + 1;
-  const flagSum = ["hot", "churn", "leak", "idle"]
-    .filter(f => nFlag[f])
-    .map(f => `${nFlag[f]} ${f}`)
-    .join(" · ");
-  meta.textContent = `${data.host || "host"} · ${data.cpu_count} cpus${ram} · ${a.length} agents${load}${flagSum ? " · " + flagSum : ""} · ${new Date(data.ts*1000).toLocaleTimeString()}`;
-  document.title = a.length
-    ? `${a.length} agent${a.length===1?"":"s"} · ${totCpu.toFixed(0)}% cpu`
-    : "agent usage manager";
-  cfgEl.className = data.config_error ? "cfg err" : "cfg";
-  cfgEl.textContent = data.config_error
-    ? `config error — running on last good config: ${data.config_error}`
-    : `config: ${data.config_path} (edits hot-reload)`;
-  empty.hidden = a.length > 0;
-  if (!a.length) empty.textContent =
-    `No matching agents running. Edit ${data.config_path} to add matchers — changes apply without a restart.`;
-  // Drop the GPU column entirely when nothing reports GPU (Apple Silicon has no
-  // per-process GPU API) — an always-"—" column reads as broken, not empty.
-  document.body.classList.toggle("hide-gpu", !a.some(x => x.gpu_mem_mb != null));
-  const cpus = data.cpu_count || 1;
-
-  // Keyed update: one <tbody> per agent. Rewriting a row in place keeps its
-  // geometry stable; tbodys are only MOVED (reordered) when the pointer is
-  // away from the table, so a kill button never shifts under the cursor.
-  // Flagged rows first (hot/churn before the quiet fleet) so "what's wrong" is
-  // the top of the page; within a group the stable sort keeps the server's
-  // CPU-desc order.
-  const flagRank = {hot: 0, churn: 1, leak: 2, idle: 3};
-  a.sort((p, q) => (flagRank[p.flag] ?? 4) - (flagRank[q.flag] ?? 4));
-  const seen = new Set();
-  lastRows.clear();
-  for (const x of a) {
-    const key = rowKey(x);
-    seen.add(key);
-    lastRows.set(key, x);
-    let tb = bodies.get(key);
-    if (!tb) {
-      tb = document.createElement("tbody");
-      bodies.set(key, tb);
-      tbl.appendChild(tb);
-    }
-    tb.firstElementChild ? tb.firstElementChild.outerHTML = rowHTML(x, cpus, data.ts)
-                         : tb.innerHTML = rowHTML(x, cpus, data.ts);
-  }
-  for (const [key, tb] of bodies) {
-    if (!seen.has(key)) { tb.remove(); bodies.delete(key); expanded.delete(key); }
-  }
-  if (!overTable) {
-    const order = a.map(x => bodies.get(rowKey(x)));
-    const current = [...tbl.querySelectorAll("tbody")];
-    if (order.some((tb, i) => tb !== current[i])) order.forEach(tb => tbl.appendChild(tb));
-  }
-  // refresh unfolded subtrees so child cpu/mem stay live
-  for (const [key, pid] of expanded) if (seen.has(key)) loadTree(pid, key);
+  if(String(window.getSelection&&window.getSelection()||"").length)return;
+  renderTop();
+  renderEvidence();
+  renderList();
+  renderInspector();
 }
 
-refresh();
-setInterval(refresh, 3000);
+function refreshNow(){
+  if(!refreshPending)refreshPending=fetchSnapshot().finally(()=>{refreshPending=null;});
+  return refreshPending;
+}
+
+async function fetchSnapshot(){
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),8000);
+  try{
+    const r=await fetch("/api/agents",{signal:ctrl.signal});
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    data=await r.json();
+    tokenPath=data.token_path||"";
+    hostName=data.host||"";
+    lastFetchOk=Date.now();
+    fetchFail=null;
+    if(eventView?.record&&Array.isArray(data.events)&&data.ts>=eventView.record.observed_at&&!data.events.some(e=>e.id===eventView.id)){
+      eventView={id:eventView.id,error:"This observation is no longer retained. Warning history lasts at most 48 hours and clears when the monitor restarts."};
+    }
+    if(selectedKey&&!eventView&&data.agents.some(x=>keyOf(x)===selectedKey))loadTree(selectedKey);
+    const liveKeys=new Set(data.agents.map(keyOf));
+    for(const key of treeCache.keys())if(key!==selectedKey&&!liveKeys.has(key))treeCache.delete(key);
+  }catch(e){
+    fetchFail=e.name==="AbortError"?"request timed out":(e.message||"fetch failed");
+  }finally{
+    clearTimeout(timer);
+  }
+  render();
+}
+
+async function loop(){
+  await refreshNow();
+  clearTimeout(pollTimer);
+  pollTimer=setTimeout(loop,3000);
+}
+
+$("#search").addEventListener("input",()=>{if(data)renderList();});
+$("#warnings").addEventListener("change",()=>{if(data)renderList();});
+$("#runtime").addEventListener("change",()=>{if(data)renderList();});
+$("#sort").addEventListener("change",()=>{if(data)renderList();});
+$("#theme").addEventListener("click",()=>{
+  const dark=document.documentElement.dataset.theme?document.documentElement.dataset.theme==="dark":matchMedia("(prefers-color-scheme:dark)").matches;
+  const next=dark?"light":"dark";
+  document.documentElement.dataset.theme=next;
+  try{localStorage.setItem("aum-theme",next);}catch(e){}
+  $("#theme").textContent=dark?"Night edition":"Day edition";
+});
+try{
+  const saved=localStorage.getItem("aum-theme");
+  if(saved==="light"||saved==="dark")document.documentElement.dataset.theme=saved;
+}catch(e){}
+$("#do-stop").addEventListener("click",executeStop);
+$("#do-force").addEventListener("click",()=>{dialogForce=!dialogForce;drawStopDialog();renderStale();});
+$("#cancel-stop").addEventListener("click",()=>$("#confirm").close());
+
+renderInspector();
+setInterval(renderStale,500);
+window.addEventListener("popstate",readRoute);
+readRoute();
+loop();
 </script>
 </body>
 </html>

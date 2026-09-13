@@ -1,7 +1,6 @@
 # agent-usage-manager — Low-Level Design
 
-**Refreshed:** 2026-08-26 (public/private config boundary); previously
-2026-08-25 (frontend dogfood fixes).
+**Refreshed:** 2026-09-13 (0.3.0 release metadata and operator reference).
 
 Code layout: one FastAPI module (`agent_usage_manager/app.py`), one CLI module
 (`agent_usage_manager/cli.py`), one static frontend
@@ -60,6 +59,8 @@ alerts:                       # optional: shell command on badge appearance
   cooldown: 600               # seconds per (label, flag) pair; default 600
   flags: [hot, churn, leak]   # default; idle is opt-in
   leak_floor_mb: 1536         # gate leak ALERTS (not the badge) below this RSS; default 0
+  dashboard_url: https://monitor.example/aum
+                              # optional, operator-owned base URL for observation links
 ```
 
 ### 1.3 Matching semantics
@@ -89,6 +90,10 @@ alerts:                       # optional: shell command on badge appearance
 - `_cpu_mem(pid, procmap) -> (cpu%, mem_mb)` (app.py:1114-1132) — persistent
   `psutil.Process` handles in `_handles` (lock-guarded) so `cpu_percent(None)`
   measures since-last-poll; first sight primes the counter (reads 0.0 once).
+- `_project_name(proc) -> str` reads a root process's working directory and
+  returns its redacted basename, `Home directory` for the user's home, or an
+  empty string when access is unavailable. It does not discover repository or
+  task identity, and the full directory path is not included in the response.
 - `_cached(key, ttl, fn)` (app.py:503-515) — TTL memo for the subprocess
   shell-outs, computed outside the lock. Users: `_gpu_by_pid()` (app.py:650,
   `nvidia-smi --query-compute-apps`, MiB per pid), `_launchd_jobs()`
@@ -101,7 +106,7 @@ alerts:                       # optional: shell command on badge appearance
   gui/$UID/<label>` grep for KeepAlive; False on any error (milder wording,
   never over-claims). Backs the supervised-row `keepalive` payload field and
   the 409 wording on the kill path.
-- `_instance_label(root, base, meta, panes, jobs) -> str` (app.py:609-647) —
+- `_instance_identity(root, base, meta, panes, jobs) -> tuple[str, str]` —
   per-instance identity, two configured sources in precedence order:
   (1) walk root + ancestors for the nearest tmux pane; if its session matches
   `tmux_labels:`, the first capture group becomes the row label (whole match if
@@ -109,9 +114,12 @@ alerts:                       # optional: shell command on badge appearance
   outer session's name; (2) else the root's own launchd job label matched
   against `launchd_labels:` — first capture group, or the whole job label when
   the regex has no group (a prefix-only match would make a useless label).
-  Fallback is the matcher label. The derived label feeds churn, alerts, and
-  `/metrics` so same-binary fleet bots (tmux sessions) and supervised fleets
-  (launchd jobs) both get per-instance state.
+  Fallback is the matcher label. The second value is `tmux`, `launchd`, or
+  `matcher`; `_instance_label(...)` retains the existing string-returning
+  interface. This is display and metrics grouping only.
+  `instance_id` uses `launchd:<job>` for supervised roots and
+  `process:<pid>:<create_time>` otherwise; alerts use this identity rather
+  than a potentially shared display label.
 
 ### 2.1 History, flags, churn (module globals, app.py:761-789)
 
@@ -119,7 +127,8 @@ alerts:                       # optional: shell command on badge appearance
   `_HISTORY_MAX = 400` (~20 min at 3s). Keyed on `(pid, create_time)` so a
   recycled pid starts fresh. Guarded by `_history_lock` along with
   `_label_of_key`, `_churn_deaths`, `_leak_since`.
-- `_trend_and_flag(key, uptime_s) -> (trend, flag)` (app.py:947-1005):
+- `_history_assessment(key, uptime_s) -> (trend, flag, evidence)` owns the
+  condition evaluation. `_trend_and_flag(...)` retains its two-value interface:
   - `trend` = last 40 CPU samples (sparkline).
   - `hot` — mean CPU ≥ 90% over a **fully-covered** 5-min window.
   - `leak` — over a 15-min window: tail median ≥ 1.3× head median, delta
@@ -129,47 +138,87 @@ alerts:                       # optional: shell command on badge appearance
   - `idle` — uptime & span ≥ 10 min with p95 CPU < 2% (p95 not max, so one GC
     blip can't suppress it).
   - All windows require actual span coverage — a young series never flags.
-- Churn (`app.py:770-786`): a crash loop is invisible to hot/idle (fresh pid
-  every poll), so deaths are tracked **per label**. `_note_death_locked`
+  - Evidence is the statistic actually evaluated: five-minute CPU mean;
+    fifteen-minute baseline/tail median, growth, floor, and sustained duration;
+    or ten-minute p95 CPU. It includes thresholds, interval, sample timestamp,
+    and count. Churn adds scoped exit times, count, lifetime limit, and threshold.
+    `idle_ok` suppression clears both the flag and its evidence.
+- Churn: a crash loop is invisible to hot/idle (fresh pid every poll),
+  so deaths are tracked by supervisor identity. `_note_death_locked`
   records a vanished root that died younger than `_CHURN_LIFETIME_S = 120` s;
   `_restarts_in_window(label, now)` counts deaths within
   `_CHURN_WINDOW_S = 600` s; ≥ `_CHURN_MIN_DEATHS = 3` forces
-  `flag = "churn"`, outranking hot/idle (app.py:1187-1190).
-  `_last_death_in_window(label, now)` reads the newest in-window death
+  `flag = "churn"` for that launchd job, outranking hot/idle.
+  Unsupervised exits use a separate `runtime:<matcher label>` bucket and
+  appear in top-level `runtime_exits`; their rows retain `restarts=0` and
+  `last_restart=null`. Neither a shared matcher nor tmux session proves that
+  an exit was a crash. Removing a still-live root through config changes or
+  tree regrouping does not record a death.
+  `_last_death_in_window(identity, now)` reads the newest in-window death
   (read-only; `_restarts_in_window` owns pruning) for the `last_restart`
   payload field.
 
-### 2.2 Alerts (app.py:704-774)
+### 2.2 Alerts
 
-- `_check_alerts(agents, now, host)` (app.py:915-944) — flags tracked per
-  label in `_prev_flag`; an alert fires only on a flag **appearing**
-  (transition), only for flags in `cfg["flags"]`, and only if
-  `now - _last_alert[(label, flag)] >= cooldown`. A `leak` below
-  `leak_floor_mb` is tracked as *unflagged* so crossing the floor later counts
-  as the appearance. Transitions are tracked even with no command configured,
-  so enabling alerts later doesn't re-announce long-standing flags.
-- `_spawn_alert(command, agent, host)` (app.py:859-913) — `subprocess.Popen(...,
-  shell=True, start_new_session=True)`, stdout devnulled, stderr captured. A
-  daemon `_confirm` thread waits (60s cap) and on non-zero exit logs the
-  failure and REFUNDS the cooldown (`_last_alert` entry popped, if untouched)
-  so a broken alert channel doesn't suppress the retry for a full cooldown;
-  a spawn `OSError` refunds immediately. Runtime data goes **only** through
-  env vars: `AUM_MSG`, `AUM_LABEL`, `AUM_FLAG`, `AUM_PID`, `AUM_CPU`,
-  `AUM_MEM_MB`, `AUM_RESTARTS`, `AUM_HOST`.
-  `AUM_MSG` (`_alert_message`) leads with the plain-English verdict — the
-  opening words are what a notification shows — and trails the machine
-  snapshot in brackets: "Codex is crash-looping — 4 restarts in 10 min
-  [agent-usage-manager · churn · host · cpu 5% · …]"; one line, since alert
-  commands pass it to `--title`/`-message` verbatim.
-- Server-mode gate: alerts run only when `_sampler_started` is set
-  (app.py:1243-1244) — the one-shot `list` CLI never alerts.
+- `_alert_key(agent)` returns `(instance_id, flag)`, falling back to the label
+  for callers constructing an `Agent` without identity. `_prev_flag` records
+  condition state; `_alert_deliveries` owns `_AlertDelivery` records containing
+  the current agent, command, host, attempts, next attempt, status, error, and
+  reservation timestamp. `_last_alert` remains the cooldown ledger.
+- `_check_alerts(agents, now, host)` creates a pending delivery on a selected
+  flag transition. Below-floor leaks remain unflagged. An appearance inside
+  cooldown waits until cooldown expires; confirmed failures retry even while
+  the flag stays unchanged. Clearing a condition or disabling its alert
+  removes pending work. Enabling alerts does not announce pre-existing flags.
+- `_spawn_alert(command, agent, host)` dispatches outside `_alert_lock` using
+  the existing shell command and `AUM_*` environment fields. `_finish_alert`
+  accepts a callback only for the same delivery record, so late callbacks
+  cannot overwrite a newer condition. Nonzero exits and spawn errors refund
+  the reservation and retry after five, then ten seconds, with three attempts
+  maximum. A sixty-second timeout becomes `unconfirmed` without retry because
+  the command may still deliver. Success becomes `delivered`, meaning exit 0
+  from the configured command, not independently verified downstream receipt.
+- `_delivery_snapshot()` returns identity, label, flag, status, attempts,
+  next retry time, and a bounded error summary. Command text and environment
+  values are not exposed. Subprocess stderr is redacted in server logs.
+- Alerts run only after `_sampler_started`; one-shot `list` never sends them.
+- `_record_events(agents, now, host)` captures each `(pid, create_time, flag)`
+  onset into `_events`, with a random public observation ID, the root snapshot,
+  evaluated evidence, and up to 400 timestamped CPU/RSS observations. Active
+  observations update only `last_observed_at`; the onset evidence stays fixed.
+  Clearance sets `status=cleared`; a root leaving the sample sets
+  `status=not_observed`, which does not assert that the OS process exited.
+  `_event_lock` guards `_events` and `_active_events`; retention is at most
+  100 observations and 48 hours from onset. Each record carries `retained_until`
+  as its maximum retention deadline; the count cap may evict it earlier. An
+  expired ongoing condition does not mint another event until its condition
+  changes. Restart clears history.
+- `_inspection_path(agent)` selects `/?event=<id>` when the bounded observation
+  exists, otherwise `/?pid=<pid>&create_time=<ct>`. `_inspection_url` prefixes
+  optional `alerts.dashboard_url`; the loader accepts only HTTP(S) base URLs
+  without embedded credentials, whitespace, a query, or a fragment. Missing or
+  invalid bases leave absolute links disabled. Alerts add `AUM_CREATE_TIME`,
+  `AUM_EVENT_ID`, `AUM_INSPECT_PATH`, and `AUM_INSPECT_URL` to the existing
+  environment contract. `AUM_TITLE` contains the measured plain-English verdict
+  from `_alert_title`, without diagnostic metadata or a URL; `AUM_MSG` retains its
+  one-line compatibility format. The CLI supplies a synthetic test title. A
+  configured absolute link is appended to the existing
+  one-line `AUM_MSG`; hot/leak text uses the measured condition when available.
+  The CLI's synthetic `test-alert` leaves these four observation fields empty.
 
 ### 2.3 Background sampler
 
-- `_lifespan` (app.py:785-686) starts one daemon thread running
-  `_sampler_loop` (app.py:1007-1017): every 3s, call `list_agents()` unless the
-  frontend poll already did within the last 3s (`_last_collect` monotonic
-  stamp) — trends accrue browserless without double-sampling.
+- `_lifespan` publishes the first sample, then starts `_sampler_loop`.
+  `_sample_agents() -> tuple[dict, dict]` owns collection, CPU reads, history,
+  flags, and alert evaluation. `_tree_rows(...)` builds child detail from
+  the same per-process measurements. `_publish_snapshot()` atomically stores
+  data and trees under `_snapshot_lock`, clearing the collection error.
+- Server reads return copies of the last sample. Browser, expanded-tree,
+  and Prometheus traffic cannot change the sampling cadence or CPU baseline.
+  The loop sleeps `_SAMPLE_INTERVAL_S=3` between collections; failures are
+  logged and surfaced as 503. `_SNAPSHOT_MAX_AGE_S=10` also rejects a stalled
+  collector. Without a running sampler, `list_agents()` publishes a one-shot
+  collection for CLI use and direct invocation.
 
 ## 3. HTTP surface (app.py)
 
@@ -184,7 +233,8 @@ Applies to every request:
 
 ### 3.2 Endpoints
 
-- `GET /api/agents` → `list_agents() -> dict` (app.py:1136-1261). Main path:
+- `GET /api/agents` → `list_agents() -> dict` returns the cached server
+  snapshot. The sampler's `_sample_agents()` collection path is:
   reload config → cached gpu/launchd/tmux maps → `_collect()` → compute roots
   → per root: sum tree cpu/mem/gpu, derive instance label, append history,
   `_trend_and_flag`, churn override, `idle_ok:` suppression (an `idle` flag on
@@ -195,18 +245,21 @@ Applies to every request:
   deaths) → sort by CPU desc → maybe `_check_alerts`. Response shape:
 
   ```json
-  { "api_version": 1, "aum_version": "0.2.5",
+  { "api_version": 2, "aum_version": "0.3.0",
     "agents": [Agent...], "host": "...", "cpu_count": N,
     "mem_total_mb": N, "mem_used_pct": N,
     "config_path": "...", "config_error": null,
-    "token_path": "...", "ts": epoch }
+    "token_path": "...", "ts": epoch, "sample_interval_s": 3,
+    "sample_age_s": seconds, "runtime_exits": [], "alert_deliveries": [],
+    "events": [] }
   ```
 
   `token_path` is deliberately non-secret (the file is 0600; knowing the path
   changes nothing — app.py:1246-1250).
 
 - **`Agent` model** (pydantic `BaseModel`, app.py:1020-1054): `pid`,
-  `create_time` (pair with pid to defeat PID-reuse aliasing), `label`, `name`,
+  `create_time` (unrounded OS timestamp), `label`, `runtime`, `instance_id`,
+  `project` (working-directory basename, possibly empty), `name`,
   `cmdline` (redacted, truncated to 300), `status`, `alive` (not zombie),
   `cpu_percent`/`mem_mb`/`gpu_mem_mb` (tree totals; gpu `None` when no data),
   `uptime_s`, `child_count`, `protected`, `supervised` (launchd label or
@@ -214,15 +267,36 @@ Applies to every request:
   `None` — whether the supervising job has KeepAlive, so consumers can word
   the supervision note precisely), `trend: list[float]`,
   `flag: Optional[str]` in {hot, idle, churn, leak}, `restarts: int`,
-  `last_restart: Optional[float]` (epoch of the newest in-window death —
-  the dashboard's "restarted 3m ago" on a churn badge).
+  `last_restart: Optional[float]` (epoch of the newest short-lived supervised
+  exit). `runtime_exits` entries contain runtime, short-lived exit count,
+  and last-exit epoch; they never imply a specific live process restarted.
+  Added fields: `label_source`, `child_pids` (descendant lookup), nullable
+  `tree_revision` (captured identity/protection fingerprint), nullable
+  `evidence` (active condition), and nullable `event_id`.
 
-- `GET /api/tree/{pid}` → `agent_tree(pid) -> dict` (app.py:1307-1345). 404 if
+- `GET /api/tree/{pid}?create_time=...` → `agent_tree(pid, create_time) -> dict`. 404 if
   no such pid; 403 unless `_label_for(_match_target(proc))` hits (same target
-  authorization as kill — can't walk arbitrary trees). DFS with parent-first
-  sibling order; rows `{pid, name, cpu_percent, mem_mb, cmdline[:200], depth}`.
+  authorization as kill — can't walk arbitrary trees). A supplied identity
+  mismatch or an unsampled root returns 409. Returns cached DFS rows from
+  the sampler, with response `pid`, `create_time`, `ts`, and `tree` fields;
+  rows contain `{pid, create_time, protected, name, cpu_percent, mem_mb,
+  cmdline[:200], depth}`. Response also includes `tree_revision`, `evidence`,
+  and up to 400 `history` triples `[timestamp, cpu_percent, mem_mb]` through
+  the captured sample timestamp. History reads do not evaluate conditions or
+  advance CPU baselines. `_tree_revision(rows)` hashes sorted PID/create-time/
+  protection tuples; missing or nonfinite creation times return null.
 
-- `POST /api/kill/{pid}?force=false` → `kill_agent(...)` (app.py:1348-1449).
+- `GET /api/events` returns bounded observation summaries and `retention_s`.
+  `GET /api/events/{id}` returns the captured root, evidence/history, and
+  current observation status plus `retained_until`. The browser uses that deadline
+  for its retention label (one-hour fallback for earlier API v2 servers). Missing,
+  expired, or restart-lost IDs return 404
+  with an explicit retention explanation; these endpoints never select a
+  replacement process or perform an action.
+
+- `POST /api/kill/{pid}?force=false&create_time=...&tree_revision=...` → `kill_agent(...)`.
+  The tree revision is optional for existing API v2 callers; creation time
+  remains required. New clients can opt into the stronger scope precondition.
   Ordered gates, each refusal action-logged:
   1. **Caller auth:** `X-Kill-Token` vs `KILL_TOKEN` via
      `secrets.compare_digest` on bytes (constant-time) → 403
@@ -234,16 +308,31 @@ Applies to every request:
   4. **Supervision:** pid in launchd jobs → 409 with `launchctl bootout`
      guidance, wording split on `_keepalive` (won't stick vs restarts at
      login) (app.py:1390-1405).
-  5. `_signal_tree(proc, force)` (app.py:1264-1304): fresh `_collect()`,
+  5. **Displayed identity:** missing `create_time` → 428; non-finite or
+     unequal to the current process's creation time → 409. Both are logged.
+     The browser sends the exact timestamp retained when opening confirmation.
+  6. `_signal_tree(proc, force, tree_revision=None, audit=None)`: fresh `_collect()`,
      **create_time compared** against the pinned handle (pid reuse → signal
-     nothing), then `terminate()`/`kill()` on root + descendants, skipping
-     self/PID 1/protected. psutil methods map to SIGTERM/SIGKILL on POSIX,
+     nothing), then capture all identities/protection states. A supplied revision
+     mismatch raises 409 before any signal. Capture and signal errors are
+     recorded as skipped identities with reasons. Eligible handles receive
+     `terminate()`/`kill()`, skipping self/PID 1/protected. psutil methods map to SIGTERM/SIGKILL on POSIX,
      TerminateProcess on Windows.
-  6. `psutil.wait_procs(timeout=3)`; a non-force kill **auto-escalates**
+  7. `psutil.wait_procs(timeout=3)`; a non-force kill **auto-escalates**
      survivors to `kill()` + another 3s wait (app.py:1420-1428). Returns
      `{pid, result, method, killed, still_running}`; a target that exited
      between auth and signal returns `result: "already exited"` (pid-reuse
      aware via `is_running()`).
+     Additional fields are `captured`, `signaled`, `skipped`, `skipped_count`,
+     `stopped`, `survivors`, `tree_revision`, and `scope_checked`. `killed` and
+     `still_running` retain their counts within the signaled set. Any skipped
+     process changes result wording; no claim covers subsequently born processes.
+     `scope_checked` records an attempted tree comparison, including a mismatch;
+     a root that disappears before capture still records false. A continuously
+     changing tree can keep failing this precondition; the browser does not
+     silently drop it or broaden the signal set.
+     Early no-signal results omit stopped/survivor lists. Action logs include
+     root creation time and the same captured identity accounting.
 
 - `GET /metrics` → `metrics() -> PlainTextResponse` (app.py:1460-1525).
   Calls `list_agents()`, aggregates **per label** (pids churn; per-pid series
@@ -251,9 +340,12 @@ Applies to every request:
   (sum), `aum_agent_mem_mb` (sum), `aum_agent_restarts_10m` (max),
   `aum_agent_flag{flag=hot|idle|churn|leak}` 0/1, `aum_agent_gpu_mem_mb` (only
   when reported), plus host-level `aum_agents`, `aum_host_mem_used_percent`,
-  `aum_host_cpu_count`. Label values escaped via `_prom_escape` (app.py:1455).
+  `aum_host_cpu_count`. `aum_runtime_short_lived_exits_10m{runtime=...}`
+  exposes uncorrelated exits separately. Label values are escaped through
+  `_prom_escape`.
 
-- `GET /` → `FileResponse(static/index.html)` (app.py:1528-1530); `/static`
+- `GET /` → `FileResponse(static/index.html)` with `Cache-Control: no-cache`
+  so later visits revalidate the inline interface after deployment; `/static`
   mount (app.py:1532).
 
 ## 4. Security primitives (app.py)
@@ -315,56 +407,95 @@ Applies to every request:
 
 ## 6. Frontend (static/index.html)
 
-Single inline `<script>` (index.html:140-460), no framework.
+One static HTML document with embedded CSS and JavaScript; no framework or build step.
 
-- **Poll loop:** `refresh()` every 3s (index.html:459-460). On fetch failure
-  the table is kept but dimmed with a stale banner (`body.stale`,
-  index.html:378-387) — never blank data someone might kill from. Skips
-  re-render while text is selected (copying a launchctl hint).
-- **Keyed rendering:** one `<tbody>` per agent, keyed by `pid:create_time`
-  (`rowKey`; the `bodies`/`expanded` maps) so a recycled pid can't inherit
-  another agent's row; rows are rewritten in place, tbodys sorted
-  flagged-first (hot/churn/leak/idle, then the server's CPU-desc order within
-  a group) but **only reordered when the pointer is off the table**
-  (`overTable`, index.html:159-161, 450-454) so the kill button can't shift
-  under the cursor. The header carries the flag counts (`1 hot · 4 idle`).
-- **Kill flow:** `kill(rowKey, force)` — the row's payload is looked up in
-  `lastRows` (keyed by `pid:create_time`, rebuilt each refresh) so the
-  `confirm()` can name the agent's label + truncated cmdline, not just the PID
-  (rows in a fleet share labels; the PID is the one identifier the operator
-  can't check against intent). The verb is honest about escalation: plain kill
-  reads "SIGTERM → SIGKILL after 3s" (the server auto-escalates survivors), and
-  the kill button's tooltip says the same; `force` stays the ghost-styled
-  SIGKILL. Then `killToken()`: localStorage, `prompt()` on first use pointing
-  at `token_path` AND the server's `host` from the API (with an ssh one-liner)
-  — a remote browser over a tunnel needs to know the path is server-side.
-  → `POST /api/kill/{pid}` with `X-Kill-Token`. A 403 mentioning the token
-  clears localStorage so the next click re-prompts (rotation-aware). Both the
-  ✓ and ✗ result lines auto-clear on a `setTimeout` (longer for the ✗
-  partial-failure, which needs reading time) so no outcome sticks forever.
-- **Tree expansion:** `toggleTree`/`loadTree`/`renderTree`
-  (index.html:297-318) fetch `/api/tree/{pid}` and insert indented child rows;
-  expanded subtrees are re-fetched on every refresh (index.html:456).
-- **Rendering details:** `esc()` HTML-escapes all host data (injection into a
-  page with a kill endpoint is a real risk, index.html:165-170); `spark()`
-  draws the SVG sparkline; badges hot/idle/churn/leak with explanatory
-  tooltips (index.html:333-341; the launchd badge's tooltip follows the
-  payload's `keepalive` — "won't stick" only for KeepAlive jobs); supervised
-  rows swap kill buttons for a
-  click-to-copy `launchctl bootout` hint whose denial path is loud — a
-  rejected clipboard write flashes "copy failed" on the chip and selects the
-  command for a manual ⌘C, never a silent no-op; GPU column hidden when
-  nothing reports GPU (`body.hide-gpu`); protected rows get disabled buttons
-  (the server refuses regardless). The actions column is `position: sticky`
-  on the right above the phone breakpoint (`.c-act`, index.html:35-39), so
-  the kill verb stays on-screen while the ~1.5kpx-wide nowrap table scrolls
-  horizontally at mid-width. At ≤700px rows stack (agent+badges / cpu·mem /
-  actions), the sparkline hides, and the column headers drop, so the
-  kill verb is on-screen at phone width; with the headers gone the cpu/mem
-  numbers carry their own units (`.unit`), child rows keep their cmdline
-  (their only identity, `tr.child td.c-cmd`), and the launchd hint truncates
-  from the left (`direction: rtl`) so the job label — not the identical
-  `launchctl bootout gui/501/` prefix — stays visible.
+- **Layout:** a full-width resource table until a process or observation is selected;
+  the optional desktop inspector then sits beside it. At widths up to 760px,
+  selection hides the table/intro/totals and opens the inspector with Back/Close.
+  The phone page scrolls normally rather than nesting a fixed-height table.
+  Labels lead each row; directory, runtime, PID, age, supervision, and ambiguous
+  shared names remain visible. Aligned CPU/RSS values and CPU sparklines support
+  scanning. Warning-first then CPU is the default sort; a counted warning filter,
+  runtime filter, and explicit CPU/memory sorting operate on the current snapshot.
+  The identity header is hidden inside an iframe. Light/dark palettes follow the
+  system preference or the browser's `aum-theme` choice; serif prose, 12px panels,
+  9px inputs, and pill actions follow the approved mock.
+- **Identity and selection:** `keyOf` pairs PID with exact creation time. Persistent
+  row elements in `rowEls` preserve list focus; sorting pauses while the pointer
+  or keyboard focus is inside the list. `selectedKey` never switches to a new
+  incarnation of the same PID. A missing selection retains its last identity
+  with an explicit unavailable state and no stop action.
+  Exact numeric searches also match `child_pids`, locating the owning root.
+- **Navigation:** `setRoute` writes either `?pid=<pid>&create_time=<ct>` or
+  `?event=<id>`; `readRoute` supports direct entry and browser Back/Forward.
+  A process link requires both identity fields and never follows PID reuse.
+  `openObservation` validates the public observation ID and reads its bounded
+  endpoint. An incrementing request identity prevents a late response from
+  replacing a newer selection. Missing/expired/restart-lost observations render
+  an explicit unavailable state. Saved views have no stop control: the quiet
+  `Inspect current process` action exists only for the same PID/create-time pair
+  in the latest snapshot and transitions to a fresh live review.
+- **Polling:** `loop()` schedules `refreshNow()` every three seconds after the
+  previous read completes. `refreshPending` deduplicates regular and post-stop
+  refreshes; `fetchSnapshot()` aborts a hung request after eight seconds. Cached
+  data stays visible on errors. `isStale()` combines the server's sample age
+  with locally elapsed time; a 500ms watchdog updates the warning and disables
+  both inspector and open-dialog stop actions independently of fetch completion.
+  Text selection pauses rerendering without bypassing freshness checks.
+- **Inspector:** source labels and OS status are separate from unavailable task
+  progress. Resource totals, optional GPU memory, and supervised exit counts use
+  supplied evidence. `evidenceHTML` renders the evaluated statistic, threshold,
+  interval, timestamp, and count. `chartHTML` uses timestamped CPU/RSS samples;
+  memory is primary for a growth warning, CPU otherwise, with the other metric
+  in a disclosure. CPU sparklines are the fallback when history is unavailable;
+  a missing memory series is explicit. Saved observations use their frozen onset
+  samples and status rather than current resource numbers. Observation, command,
+  and child-tree folds preserve reading state; no history is invented. Command
+  text remains redacted and truncated by the API; the copy control identifies
+  it as the displayed excerpt.
+- **Tree detail:** `loadTree(key)` requests `/api/tree/{pid}?create_time=...` for
+  the selected incarnation. `treePending` deduplicates per-key requests and
+  `treeCache` stores their results. The selected live tree refreshes with the
+  main poll so charts do not depend on opening the child fold. `readJSON` caps
+  tree/event requests at eight seconds. A tree response renders only while its
+  exact key remains selected. Nonselected departed-root cache entries are pruned.
+  Cache entries retain history, evidence, revision, and timestamp along with rows.
+  Each child has a disclosure for its timestamp, CPU, protection, and redacted
+  command, so command inspection also works with touch and keyboard.
+- **Stop review:** `inspectedSnapshot` binds the stop control to the tree revision
+  actually rendered in the inspector, retaining that revision when text selection
+  defers a refresh. Missing details or a revision different from the latest row
+  disable review. `openStop()` captures that snapshot as an immutable `dialogSnap`
+  in a body-level native dialog. PID, exact start time, label, command excerpt,
+  child count, and signal behavior are shown before confirmation. The primary choice sends
+  SIGTERM and escalates survivors to SIGKILL after three seconds. A secondary
+  choice switches to an explicit immediate-SIGKILL confirmation. `stopProblem()`
+  rechecks freshness, current identity, protection, supervision, and the captured
+  tree revision before a
+  request; token entry is followed by another check. `pendingStop` prevents
+  duplicate submission. The POST includes the captured `create_time` and
+  `X-Kill-Token`, plus `tree_revision` when the server supplies one. A changed
+  revision disables the open review; a null revision makes the root unavailable
+  for stop. Older API v2 servers lacking the field retain root-only behavior and
+  the dialog explicitly discloses that limitation. An open dialog never follows
+  refreshed row data to a new process. Child counts are described as observed,
+  and copy states that protection and later spawning can leave survivors.
+- **Authorization and feedback:** `killToken()` retains the existing operator
+  paste flow and browser-local token storage; the token is never fetched over
+  HTTP. A token-related 403 clears the stored value. Protected processes have
+  no active stop control. Supervised processes show a copyable service stop
+  command with KeepAlive/RunAtLoad guidance; the browser never executes it.
+  Clipboard failures are visible and allow manual selection. Success, partial
+  completion, and error feedback live outside the refreshing inspector for
+  12–20 seconds. Any skipped process is reported as partial completion rather
+  than a green whole-tree success.
+- **Evidence and escaping:** uncorrelated runtime exits appear once per runtime,
+  never as a session restart. Monitor details contains configuration/delivery
+  detail and the bounded Recent warnings list. Configuration errors and
+  failed/retrying/unconfirmed alert delivery also get a visible summary above
+  the table. Host-supplied strings are escaped before HTML
+  insertion. Search, inspector, modal, warning, and result surfaces have
+  accessible labels or status roles.
 
 ## 7. Error handling conventions
 
@@ -398,6 +529,16 @@ Tunables are module constants, not config: `_HISTORY_MAX=400` (app.py:761),
 `_trend_and_flag` (hot 90%/5m, leak +30%/128MB/15m, idle p95<2%/10m).
 
 ## 9. Tests (tests/)
+
+- `test_reliability.py` covers the v2 stop precondition, shared sampler reads and
+  stale recovery, runtime versus supervised exits, cwd-basename projection, and
+  alert delivery retries, cancellation, callback isolation, and cooldown scope.
+- `test_frontend.js` runs six behavioral checks in Node's built-in test runner
+  against the served inline script, using isolated DOM/network/clock fixtures.
+  It checks open-dialog staleness, PID replacement, token-entry delay, poll
+  deduplication, stop submission/completion, and escaping. `test_smoke.py` runs
+  it when Node is available; Python-only environments skip that one wrapper.
+  These are logic tests; responsive, theme, and iframe checks use a browser.
 
 - `tests/test_smoke.py` — redaction, match-target rules (basename + first
   args, deep-arg immunity), config validation errors, `TestClient` API checks,

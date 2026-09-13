@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -13,10 +16,11 @@ import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import psutil
 import yaml
@@ -26,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE = Path(__file__).parent
-AUM_API_VERSION = 1
+AUM_API_VERSION = 2
 log = logging.getLogger("agent_usage_manager")
 try:
     AUM_VERSION = version("agent-usage-manager")
@@ -158,11 +162,25 @@ def load_alerts(path: Optional[Path] = None) -> Optional[dict]:
         leak_floor_mb = float(a.get("leak_floor_mb", 0))
     except (TypeError, ValueError):
         leak_floor_mb = 0.0
+    dashboard_url = str(a.get("dashboard_url") or "").strip()
+    try:
+        parsed = urlsplit(dashboard_url)
+        if (
+            parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or any(c.isspace() for c in dashboard_url)
+        ):
+            dashboard_url = ""
+        else:
+            dashboard_url = parsed.geturl().rstrip("/")
+    except ValueError:
+        dashboard_url = ""
     return {
         "command": str(a["command"]),
         "cooldown": cooldown,
         "flags": flags,
         "leak_floor_mb": leak_floor_mb,
+        "dashboard_url": dashboard_url,
     }
 
 
@@ -609,9 +627,9 @@ def _tmux_panes() -> dict[int, str]:
     return panes
 
 
-def _instance_label(
+def _instance_identity(
     root: int, base: str, meta: dict, panes: dict[int, str], jobs: dict[int, str]
-) -> str:
+) -> tuple[str, str]:
     """Display label for one agent root: tmux-derived when configured and
     applicable, else launchd-derived when configured and applicable, else the
     matcher label.
@@ -636,7 +654,8 @@ def _instance_label(
                 continue
             mo = rx.search(session)
             if mo:
-                return (mo.group(1) if mo.groups() else mo.group(0)) or base
+                value = (mo.group(1) if mo.groups() else mo.group(0))
+                return (value, "tmux") if value else (base, "matcher")
             break
     lx = LAUNCHD_LABELS
     if lx:
@@ -646,8 +665,15 @@ def _instance_label(
             if mo:
                 # No capture group → the whole job label (it IS the instance's
                 # name); a prefix-only match would make a useless label.
-                return (mo.group(1) if mo.groups() else job) or base
-    return base
+                value = (mo.group(1) if mo.groups() else job)
+                return (value, "launchd") if value else (base, "matcher")
+    return base, "matcher"
+
+
+def _instance_label(
+    root: int, base: str, meta: dict, panes: dict[int, str], jobs: dict[int, str]
+) -> str:
+    return _instance_identity(root, base, meta, panes, jobs)[0]
 
 
 def _gpu_by_pid() -> dict[int, float]:
@@ -683,6 +709,7 @@ async def _lifespan(_: FastAPI):
     # The Event guards against double-start under test clients that enter the
     # lifespan repeatedly; the thread itself (defined below) is a daemon.
     if not _sampler_started.is_set():
+        _publish_snapshot()
         _sampler_started.set()
         threading.Thread(target=_sampler_loop, daemon=True, name="aum-sampler").start()
     yield
@@ -771,15 +798,18 @@ _handles_lock = threading.Lock()
 _HISTORY_MAX = 400  # ~20 min at the 3s cadence
 _history: dict[tuple[int, float], deque] = {}
 _history_lock = threading.Lock()
-_last_collect = 0.0  # monotonic time of the last full list_agents() pass
+_snapshot_lock = threading.Lock()
+_snapshot: Optional[dict] = None
+_snapshot_trees: dict[tuple[int, float], list[dict]] = {}
+_snapshot_error: Optional[str] = None
+_SAMPLE_INTERVAL_S = 3.0
+_SNAPSHOT_MAX_AGE_S = 10.0
+_event_lock = threading.Lock()
+_events: dict[str, dict] = {}
+_active_events: dict[tuple[int, float, str], str] = {}
+_EVENT_MAX = 100
+_EVENT_TTL_S = 48 * 3600.0
 
-# Restart churn. A crash-looping agent is invisible to hot/idle: every poll
-# shows a fresh pid whose history just started, so no per-incarnation window
-# ever fills (seen live: a KeepAlive launchd job respawning every second).
-# The durable identity across restarts is the matcher label, so deaths are
-# tracked per label: several young deaths in a short window means a supervisor
-# keeps respawning a process that keeps dying. All three dicts below are
-# guarded by _history_lock.
 _CHURN_LIFETIME_S = 120.0  # a death this young counts toward churn
 _CHURN_WINDOW_S = 600.0  # deaths are remembered this long
 _CHURN_MIN_DEATHS = 3  # young deaths in the window needed to flag
@@ -842,28 +872,154 @@ _prev_flag: dict[str, Optional[str]] = {}
 _last_alert: dict[tuple[str, str], float] = {}
 
 
-def _alert_message(a: "Agent", host: str) -> str:
-    """The AUM_MSG one-liner: plain-English verdict first, metadata trailing.
+@dataclass
+class _AlertDelivery:
+    agent: Agent
+    command: str
+    host: str
+    next_attempt: float
+    attempts: int = 0
+    status: str = "pending"
+    error: Optional[str] = None
+    stamp: float = 0.0
 
-    The opening words are what a notification/feed card shows first, so they
-    must say what's wrong — "Codex is crash-looping — 4 restarts in 10 min",
-    not "[agent-usage-manager] codex is churn on host: …". The bracketed tail
-    keeps the full machine-readable snapshot (alert commands pass AUM_MSG to
-    --title/-message verbatim, so it stays a single line).
-    """
+
+_alert_deliveries: dict[tuple[str, str], _AlertDelivery] = {}
+_ALERT_MAX_ATTEMPTS = 3
+
+
+def _alert_key(agent: Agent) -> tuple[str, str]:
+    return agent.instance_id or agent.label, agent.flag or ""
+
+
+def _finish_alert(
+    key: tuple[str, str], delivery: _AlertDelivery,
+    error: Optional[str] = None, retry: bool = True,
+) -> None:
+    with _alert_lock:
+        if _alert_deliveries.get(key) is not delivery:
+            return
+        delivery.error = error
+        if error is None:
+            delivery.status = "delivered"
+        elif not retry:
+            delivery.status = "unconfirmed"
+        else:
+            if _last_alert.get(key) == delivery.stamp:
+                _last_alert.pop(key, None)
+            delivery.status = "retry" if delivery.attempts < _ALERT_MAX_ATTEMPTS else "failed"
+            delivery.next_attempt = time.time() + min(60.0, 5.0 * 2 ** (delivery.attempts - 1))
+
+
+def _delivery_snapshot() -> list[dict]:
+    with _alert_lock:
+        return [
+            {"instance_id": key[0], "label": delivery.agent.label,
+             "flag": key[1], "status": delivery.status, "attempts": delivery.attempts,
+             "next_retry_at": delivery.next_attempt if delivery.status in ("pending", "retry") else None,
+             "error": delivery.error}
+            for key, delivery in sorted(_alert_deliveries.items())
+        ]
+
+
+def _inspection_path(agent: Agent) -> str:
+    params = {"event": agent.event_id} if agent.event_id else {
+        "pid": agent.pid, "create_time": agent.create_time,
+    }
+    return "/?" + urlencode(params)
+
+
+def _inspection_url(agent: Agent) -> str:
+    base = (ALERTS or {}).get("dashboard_url")
+    return str(base).rstrip("/") + _inspection_path(agent) if base else ""
+
+
+def _event_summaries(now: float) -> list[dict]:
+    with _event_lock:
+        for event_id, event in list(_events.items()):
+            if now - event["observed_at"] > _EVENT_TTL_S:
+                _events.pop(event_id)
+        return [
+            {key: value for key, value in event.items() if key not in ("agent", "history")}
+            for event in reversed(list(_events.values()))
+        ]
+
+
+def _record_events(agents: list[Agent], now: float, host: str) -> None:
+    _event_summaries(now)
+    roots = {(a.pid, a.create_time) for a in agents}
+    current: set[tuple[int, float, str]] = set()
+    for agent in agents:
+        if not agent.flag:
+            continue
+        key = (agent.pid, agent.create_time, agent.flag)
+        current.add(key)
+        with _history_lock:
+            history = list(_history.get(key[:2], ()))
+        with _event_lock:
+            event_id = _active_events.get(key)
+            if event_id is None:
+                event_id = secrets.token_hex(12)
+                _active_events[key] = event_id
+                _events[event_id] = {
+                    "id": event_id, "pid": agent.pid, "create_time": agent.create_time,
+                    "label": agent.label, "runtime": agent.runtime, "project": agent.project,
+                    "flag": agent.flag, "host": host, "observed_at": now,
+                    "retained_until": now + _EVENT_TTL_S,
+                    "last_observed_at": now, "ended_at": None, "status": "active",
+                    "agent": agent.model_dump(), "history": history,
+                }
+                while len(_events) > _EVENT_MAX:
+                    _events.pop(next(iter(_events)))
+            event = _events.get(event_id)
+            if event is not None:
+                event["last_observed_at"] = now
+                agent.event_id = event_id
+    with _event_lock:
+        for key, event_id in list(_active_events.items()):
+            if key in current:
+                continue
+            event = _events.get(event_id)
+            if event is not None:
+                event["status"] = "cleared" if key[:2] in roots else "not_observed"
+                event["ended_at"] = now
+            _active_events.pop(key)
+
+
+def _alert_title(a: "Agent") -> str:
     verdict = {
-        "churn": f"is crash-looping — {a.restarts} restarts in 10 min",
+        "churn": f"has {a.restarts} short-lived service exits in 10 min — inspect its logs",
         "hot": f"is burning a core — cpu {a.cpu_percent:.0f}% for 5+ min (runaway?)",
-        "idle": "has gone quiet — no CPU activity for 10+ min (wedged, or just waiting?)",
+        "idle": "has gone quiet — little CPU activity for 10+ min (wedged, or just waiting?)",
         "leak": f"may be leaking — mem {a.mem_mb:.0f}MB, up ≥30% over 15 min and not coming back down",
     }.get(a.flag or "", f"is {a.flag}")
+    evidence = a.evidence or {}
+    if a.flag == "hot" and evidence.get("kind") == "hot":
+        verdict = f"averaged {evidence['mean_cpu_percent']:.0f}% of one core over five minutes — inspect its work"
+    elif a.flag == "idle" and evidence.get("kind") == "idle":
+        verdict = (
+            f"has gone quiet — ten-minute p95 CPU was {evidence['p95_cpu_percent']:.1f}% "
+            "of one core (waiting, or stuck?)"
+        )
+    elif a.flag == "leak" and evidence.get("kind") == "leak":
+        verdict = (
+            f"may be leaking — memory rose {evidence['growth_mb']:.0f}MB "
+            f"from {evidence['baseline_mb']:.0f} to {evidence['recent_mb']:.0f}MB "
+            "over 15 min and stayed elevated"
+        )
     label = a.label[:1].upper() + a.label[1:]
-    return (
-        f"{label} {verdict} "
+    return f"{label} {verdict}"
+
+
+def _alert_message(a: "Agent", host: str) -> str:
+    message = (
+        f"{_alert_title(a)} "
         f"[agent-usage-manager · {a.flag} · {host or 'this host'} · "
         f"cpu {a.cpu_percent:.0f}% · mem {a.mem_mb:.0f}MB · "
         f"restarts(10m) {a.restarts} · pid {a.pid} · up {int(a.uptime_s)}s]"
     )
+    url = _inspection_url(a)
+    return message + (f" Inspect: {url}" if url else "")
 
 
 def _spawn_alert(command: str, a: "Agent", host: str) -> None:
@@ -871,17 +1027,23 @@ def _spawn_alert(command: str, a: "Agent", host: str) -> None:
     # command text itself comes only from the user's own config file.
     env = {
         **os.environ,
+        "AUM_TITLE": _alert_title(a),
         "AUM_MSG": _alert_message(a, host),
         "AUM_LABEL": a.label,
         "AUM_FLAG": a.flag or "",
         "AUM_PID": str(a.pid),
+        "AUM_CREATE_TIME": str(a.create_time),
+        "AUM_EVENT_ID": a.event_id or "",
+        "AUM_INSPECT_PATH": _inspection_path(a),
+        "AUM_INSPECT_URL": _inspection_url(a),
         "AUM_CPU": f"{a.cpu_percent:.1f}",
         "AUM_MEM_MB": f"{a.mem_mb:.0f}",
         "AUM_RESTARTS": str(a.restarts),
         "AUM_HOST": host,
     }
-    key = (a.label, a.flag or "")
-    stamped = _last_alert.get(key)
+    key = _alert_key(a)
+    with _alert_lock:
+        delivery = _alert_deliveries[key]
     try:
         proc = subprocess.Popen(
             command,
@@ -896,8 +1058,7 @@ def _spawn_alert(command: str, a: "Agent", host: str) -> None:
             "alert command failed to start for %s/%s — cooldown not charged: %s",
             key[0], key[1], e,
         )
-        if _last_alert.get(key) == stamped:
-            _last_alert.pop(key, None)
+        _finish_alert(key, delivery, "Alert command could not start")
         return
 
     def _confirm() -> None:
@@ -908,42 +1069,62 @@ def _spawn_alert(command: str, a: "Agent", host: str) -> None:
                 "alert command still running after 60s for %s/%s — delivery unconfirmed",
                 key[0], key[1],
             )
+            _finish_alert(key, delivery, "Alert command has not confirmed delivery after 60s", retry=False)
             return
         if proc.returncode != 0:
             log.error(
                 "alert command exited %s for %s/%s — delivery failed, cooldown not charged: %s",
                 proc.returncode, key[0], key[1],
-                (err or b"").decode(errors="replace").strip()[:500],
+                _redact((err or b"").decode(errors="replace").strip())[:500],
             )
-            with _alert_lock:
-                if _last_alert.get(key) == stamped:
-                    _last_alert.pop(key, None)
+            _finish_alert(key, delivery, f"Alert command exited {proc.returncode}")
+        else:
+            _finish_alert(key, delivery)
 
     threading.Thread(target=_confirm, name="aum-alert-confirm", daemon=True).start()
 
 
 def _check_alerts(agents: list["Agent"], now: float, host: str) -> None:
-    # Flags live per label (several rows can share one), so transitions are
-    # tracked per label too: first flagged row represents the label.
     cfg = ALERTS
     leak_floor = cfg.get("leak_floor_mb", 0.0) if cfg else 0.0
     flagged: dict[str, Agent] = {}
     seen: set[str] = set()
     for a in agents:
-        seen.add(a.label)
+        identity = _alert_key(a)[0]
+        seen.add(identity)
         # A below-floor leak is tracked as unflagged, not merely muted: the
         # appearance must fire later, when the ratchet crosses the floor.
         if a.flag == "leak" and a.mem_mb < leak_floor:
             continue
-        if a.flag and a.label not in flagged:
-            flagged[a.label] = a
+        if a.flag and identity not in flagged:
+            flagged[identity] = a
+    dispatch: list[_AlertDelivery] = []
     with _alert_lock:
-        for label, a in flagged.items():
-            if a.flag != _prev_flag.get(label) and cfg and a.flag in cfg["flags"]:
-                key = (label, a.flag)
-                if now - _last_alert.get(key, 0.0) >= cfg["cooldown"]:
+        active = {_alert_key(a) for a in flagged.values() if cfg and a.flag in cfg["flags"]}
+        for key in list(_alert_deliveries):
+            if key not in active:
+                _alert_deliveries.pop(key)
+        for identity, a in flagged.items():
+            if not cfg or a.flag not in cfg["flags"]:
+                continue
+            key = _alert_key(a)
+            delivery = _alert_deliveries.get(key)
+            if a.flag != _prev_flag.get(identity) or (
+                delivery and delivery.command != cfg["command"] and delivery.status != "delivered"
+            ):
+                delivery = _AlertDelivery(
+                    agent=a, command=cfg["command"], host=host,
+                    next_attempt=max(now, _last_alert.get(key, 0.0) + cfg["cooldown"]),
+                )
+                _alert_deliveries[key] = delivery
+            if delivery:
+                delivery.agent = a
+                if delivery.status in ("pending", "retry") and now >= delivery.next_attempt:
+                    delivery.attempts += 1
+                    delivery.status = "sending"
+                    delivery.stamp = now
                     _last_alert[key] = now
-                    _spawn_alert(cfg["command"], a, host)
+                    dispatch.append(delivery)
         # Transitions are tracked even with no alert command configured, so
         # enabling alerts later doesn't instantly fire for long-standing flags.
         for label in seen:
@@ -952,9 +1133,16 @@ def _check_alerts(agents: list["Agent"], now: float, host: str) -> None:
         for label in list(_prev_flag):
             if label not in seen:
                 _prev_flag.pop(label)
+        for key, stamp in list(_last_alert.items()):
+            if key[0] not in seen and now - stamp > (cfg["cooldown"] if cfg else 600):
+                _last_alert.pop(key)
+    for delivery in dispatch:
+        _spawn_alert(delivery.command, delivery.agent, delivery.host)
 
 
-def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float], Optional[str]]:
+def _history_assessment(
+    key: tuple[int, float], uptime_s: float
+) -> tuple[list[float], Optional[str], Optional[dict]]:
     """Recent CPU series for the row sparkline, plus a sustained-state flag.
 
     hot  — mean CPU >= 90% of one core across a fully-covered 5-minute window:
@@ -980,12 +1168,16 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
         hist = list(_history.get(key, ()))
     trend = [c for _, c, _ in hist[-40:]]
     if not hist:
-        return trend, None
+        return trend, None, None
     span = now - hist[0][0]
     win5 = [c for t, c, _ in hist if now - t <= 300]
     win10 = [c for t, c, _ in hist if now - t <= 600]
     if span >= 300 and win5 and sum(win5) / len(win5) >= 90.0:
-        return trend, "hot"
+        return trend, "hot", {
+            "kind": "hot", "sampled_at": hist[-1][0], "window_s": 300,
+            "mean_cpu_percent": round(sum(win5) / len(win5), 2),
+            "threshold_cpu_percent": 90.0, "samples": len(win5),
+        }
     if span >= 900 and uptime_s >= 900:
         leak_now = False
         win15 = [(t, m) for t, _, m in hist if now - t <= 900]
@@ -1004,27 +1196,43 @@ def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float
             if leak_now:
                 since = _leak_since.setdefault(key, now)
                 if now - since >= _LEAK_SUSTAIN_S:
-                    return trend, "leak"
+                    return trend, "leak", {
+                        "kind": "leak", "sampled_at": hist[-1][0], "window_s": 900,
+                        "baseline_mb": med_head, "recent_mb": med_tail,
+                        "growth_mb": round(med_tail - med_head, 2),
+                        "growth_percent": round((med_tail / med_head - 1) * 100, 2) if med_head else None,
+                        "recent_floor_mb": tail[0], "min_growth_mb": 128.0,
+                        "min_growth_percent": 30.0, "sustained_s": round(now - since, 1),
+                        "min_sustained_s": _LEAK_SUSTAIN_S, "samples": len(win15),
+                    }
             else:
                 _leak_since.pop(key, None)
     if span >= 600 and uptime_s >= 600 and win10:
         p95 = sorted(win10)[int(0.95 * (len(win10) - 1))]
         if p95 < 2.0:
-            return trend, "idle"
-    return trend, None
+            return trend, "idle", {
+                "kind": "idle", "sampled_at": hist[-1][0], "window_s": 600,
+                "p95_cpu_percent": p95, "threshold_cpu_percent": 2.0,
+                "samples": len(win10),
+            }
+    return trend, None, None
+
+
+def _trend_and_flag(key: tuple[int, float], uptime_s: float) -> tuple[list[float], Optional[str]]:
+    trend, flag, _ = _history_assessment(key, uptime_s)
+    return trend, flag
 
 
 def _sampler_loop() -> None:
-    """Keep history accruing while no browser is polling, so the dashboard
-    shows real trends the moment it's opened — without double-sampling when
-    the 3s frontend poll is already driving collection."""
+    global _snapshot_error
     while True:
-        time.sleep(3.0)
-        if time.monotonic() - _last_collect > 3.0:
-            try:
-                list_agents()
-            except Exception:
-                pass
+        time.sleep(_SAMPLE_INTERVAL_S)
+        try:
+            _publish_snapshot()
+        except Exception:
+            log.exception("Agent collection failed")
+            with _snapshot_lock:
+                _snapshot_error = "Agent collection failed"
 
 
 class Agent(BaseModel):
@@ -1033,6 +1241,10 @@ class Agent(BaseModel):
     # caching rows so PID reuse does not make two different agents look identical.
     create_time: float
     label: str
+    runtime: str = ""
+    instance_id: str = ""
+    project: str = ""
+    label_source: str = "matcher"
     name: str
     cmdline: str
     status: str
@@ -1056,12 +1268,12 @@ class Agent(BaseModel):
     # ("hot"/"idle"/"churn"/"leak").
     trend: list[float] = []
     flag: Optional[str] = None
-    # Short-lived deaths under this label in the last 10 minutes (the count
-    # behind a "churn" flag; informative even below the flag threshold).
     restarts: int = 0
-    # Epoch of the newest death in that window (None when there are none) —
-    # lets consumers say "restarted 3m ago", not just "churn ×3".
     last_restart: Optional[float] = None
+    child_pids: list[int] = []
+    tree_revision: Optional[str] = None
+    evidence: Optional[dict] = None
+    event_id: Optional[str] = None
 
 
 def _collect() -> tuple[dict, dict, dict, dict]:
@@ -1142,15 +1354,22 @@ def _cpu_mem(pid: int, procmap: dict) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-@app.get("/api/agents")
-def list_agents() -> dict:
-    global _last_collect
+def _project_name(proc: psutil.Process) -> str:
+    try:
+        directory = Path(proc.cwd())
+    except psutil.Error:
+        return ""
+    if directory == Path.home():
+        return "Home directory"
+    return _redact(directory.name or directory.anchor)
+
+
+def _sample_agents() -> tuple[dict, dict]:
     _maybe_reload_config()
     gpu = _cached("gpu", 2.0, _gpu_by_pid)
     jobs = _cached("launchd", 2.0, _launchd_jobs)
     panes = _cached("tmux", 2.0, _tmux_panes) if TMUX_LABELS else {}
     now = time.time()
-    _last_collect = time.monotonic()
     meta, children, label_of, procmap = _collect()
     matched = set(label_of)
 
@@ -1163,6 +1382,8 @@ def list_agents() -> dict:
     ]
 
     agents: list[Agent] = []
+    trees: dict[tuple[int, float], list[dict]] = {}
+    measurements: dict[int, tuple[float, float]] = {}
     current_keys: set[tuple[int, float]] = set()
     for root in roots:
         subtree = [root] + _descendants(root, children)
@@ -1170,6 +1391,7 @@ def list_agents() -> dict:
         has_gpu = False
         for p in subtree:
             c, m = _cpu_mem(p, procmap)
+            measurements[p] = (c, m)
             cpu += c
             mem += m
             if p in gpu:
@@ -1178,26 +1400,37 @@ def list_agents() -> dict:
         info = meta[root]
         rproc = procmap.get(root)
         cmd = _cmdline(rproc) if rproc else info["name"]
-        # The per-instance label (tmux- or launchd-derived when configured) is
-        # used for everything identity-shaped downstream — churn tracking,
-        # alert transitions, /metrics series — so a fleet of same-matcher
-        # bots gets per-bot state instead of one blurred series.
-        label = _instance_label(root, label_of[root], meta, panes, jobs)
-        ct = info["ct"] or now
+        label, label_source = _instance_identity(root, label_of[root], meta, panes, jobs)
+        ct = info["ct"] or 0.0
         hkey = (root, ct)
+        runtime = label_of[root]
+        supervisor = jobs.get(root)
+        instance_id = f"launchd:{supervisor}" if supervisor else f"process:{root}:{ct}"
+        churn_key = instance_id if supervisor else f"runtime:{runtime}"
+        trees[(root, ct)] = _tree_rows(
+            root, meta, children, procmap, measurements
+        )
         current_keys.add(hkey)
         with _history_lock:
             series = _history.get(hkey)
             if series is None:
                 series = _history[hkey] = deque(maxlen=_HISTORY_MAX)
             series.append((now, round(cpu, 1), round(mem, 1)))
-            _label_of_key[hkey] = label
-        trend, flag = _trend_and_flag(hkey, now - ct)
-        restarts = _restarts_in_window(label, now)
+            _label_of_key[hkey] = churn_key
+        trend, flag, evidence = _history_assessment(hkey, now - ct)
+        restarts = _restarts_in_window(churn_key, now) if supervisor else 0
         if restarts >= _CHURN_MIN_DEATHS:
             # Churn outranks hot/idle: a respawning process can't accrue
             # either window, and the loop itself is the urgent signal.
             flag = "churn"
+            with _history_lock:
+                exits = list(_churn_deaths.get(churn_key, ()))
+            evidence = {
+                "kind": "churn", "sampled_at": now, "window_s": _CHURN_WINDOW_S,
+                "short_lived_exits": restarts, "threshold_exits": _CHURN_MIN_DEATHS,
+                "max_lifetime_s": _CHURN_LIFETIME_S,
+                "exit_timestamps": [t for t in exits if now - t <= _CHURN_WINDOW_S],
+            }
         if flag == "idle" and any(
             p in label.lower() or p in label_of[root].lower() for p in IDLE_OK
         ):
@@ -1207,11 +1440,16 @@ def list_agents() -> dict:
             # `tmux_labels:` rename (hermes → frontdoor) must not lose the
             # class-level suppression.
             flag = None
+            evidence = None
         agents.append(
             Agent(
                 pid=root,
-                create_time=round(ct, 3),
+                create_time=ct,
                 label=label,
+                label_source=label_source,
+                runtime=runtime,
+                instance_id=instance_id,
+                project=_project_name(rproc) if rproc else "",
                 name=info["name"],
                 cmdline=cmd[:300],
                 status=info["status"],
@@ -1219,9 +1457,12 @@ def list_agents() -> dict:
                 cpu_percent=round(cpu, 1),
                 mem_mb=round(mem, 1),
                 gpu_mem_mb=round(gpu_sum, 1) if has_gpu else None,
-                uptime_s=round(now - ct, 0),
+                uptime_s=round(now - ct, 0) if ct else 0.0,
                 child_count=len(subtree) - 1,
-                protected=_is_protected(
+                child_pids=subtree[1:],
+                tree_revision=_tree_revision(trees[(root, ct)]),
+                evidence=evidence,
+                protected=not ct or _is_protected(
                     _match_target(rproc) if rproc else info["name"], root
                 ),
                 supervised=jobs.get(root),
@@ -1234,7 +1475,7 @@ def list_agents() -> dict:
                 trend=trend,
                 flag=flag,
                 restarts=restarts,
-                last_restart=_last_death_in_window(label, now),
+                last_restart=_last_death_in_window(churn_key, now) if supervisor else None,
             )
         )
 
@@ -1248,7 +1489,22 @@ def list_agents() -> dict:
             if key not in current_keys:
                 _history.pop(key, None)
                 _leak_since.pop(key, None)
-                _note_death_locked(key, now)
+                if meta.get(key[0], {}).get("ct") != key[1]:
+                    _note_death_locked(key, now)
+                else:
+                    _label_of_key.pop(key, None)
+
+    with _history_lock:
+        churn_keys = list(_churn_deaths)
+    runtime_exits = []
+    for key in churn_keys:
+        count = _restarts_in_window(key, now)
+        if count and key.startswith("runtime:"):
+            runtime_exits.append({
+                "runtime": key.removeprefix("runtime:"),
+                "short_lived_exits": count,
+                "last_exit": _last_death_in_window(key, now),
+            })
 
     agents.sort(key=lambda a: a.cpu_percent, reverse=True)
     vm = psutil.virtual_memory()
@@ -1256,6 +1512,7 @@ def list_agents() -> dict:
     # Alerts only in server mode (the sampler marks it): a one-shot `list`
     # invocation inspecting current state must not fire notification commands.
     if _sampler_started.is_set():
+        _record_events(agents, now, host)
         _check_alerts(agents, now, host)
     return {
         "api_version": AUM_API_VERSION,
@@ -1273,10 +1530,70 @@ def list_agents() -> dict:
         # outside its sandbox.
         "token_path": str(TOKEN_PATH),
         "ts": now,
-    }
+        "sample_interval_s": _SAMPLE_INTERVAL_S,
+        "runtime_exits": sorted(runtime_exits, key=lambda item: item["runtime"]),
+        "alert_deliveries": _delivery_snapshot(),
+        "events": _event_summaries(now),
+    }, trees
 
 
-def _signal_tree(root: psutil.Process, force: bool) -> list[psutil.Process]:
+def _publish_snapshot() -> dict:
+    global _snapshot, _snapshot_trees, _snapshot_error
+    data, trees = _sample_agents()
+    with _snapshot_lock:
+        _snapshot = data
+        _snapshot_trees = trees
+        _snapshot_error = None
+    return copy.deepcopy(data)
+
+
+@app.get("/api/agents")
+def list_agents() -> dict:
+    if not _sampler_started.is_set():
+        return _publish_snapshot()
+    with _snapshot_lock:
+        if _snapshot is None or _snapshot_error:
+            raise HTTPException(503, "Agent collection is unavailable")
+        age = time.time() - _snapshot["ts"]
+        if age > _SNAPSHOT_MAX_AGE_S:
+            raise HTTPException(503, "Agent collection is stale")
+        data = copy.deepcopy(_snapshot)
+    data["sample_age_s"] = round(max(0.0, age), 3)
+    return data
+
+
+@app.get("/api/events")
+def condition_events() -> dict:
+    return {"events": _event_summaries(time.time()), "retention_s": _EVENT_TTL_S}
+
+
+@app.get("/api/events/{event_id}")
+def condition_event(event_id: str) -> dict:
+    _event_summaries(time.time())
+    with _event_lock:
+        event = copy.deepcopy(_events.get(event_id))
+    if event is None:
+        raise HTTPException(404, "Observation unavailable — only the latest 100 warnings are kept for at most 48 hours; restart clears history")
+    return event
+
+
+def _tree_revision(tree: list[dict]) -> Optional[str]:
+    identities = []
+    for row in tree:
+        ct = row.get("create_time")
+        if not isinstance(ct, (int, float)) or not math.isfinite(ct) or ct <= 0:
+            return None
+        identities.append((row["pid"], float(ct), bool(row.get("protected"))))
+    if not identities:
+        return None
+    encoded = json.dumps(sorted(identities), separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _signal_tree(
+    root: psutil.Process, force: bool, tree_revision: Optional[str] = None,
+    audit: Optional[dict] = None,
+) -> list[psutil.Process]:
     """Stop the root and every descendant, skipping self/PID 1/protected.
 
     `root` is the handle that passed authorization in kill_agent — its cached
@@ -1294,45 +1611,61 @@ def _signal_tree(root: psutil.Process, force: bool) -> list[psutil.Process]:
     current = procmap.get(root_pid)
     try:
         if current is None or current.create_time() != root.create_time():
+            if tree_revision is not None:
+                raise HTTPException(409, "Root process changed before its tree could be checked — review again")
             return []
     except psutil.Error:
+        if tree_revision is not None:
+            raise HTTPException(409, "Root identity unavailable before its tree could be checked — review again")
         return []
     victims = [root_pid] + _descendants(root_pid, children)
-    signaled: list[psutil.Process] = []
-    for p in victims:
-        if p in (SELF_PID, 1):
-            continue
-        proc = procmap.get(p)
-        if proc is None:
+    report = audit if audit is not None else {}
+    captured = []
+    handles = {}
+    skipped = []
+    for pid in victims:
+        proc = procmap.get(pid)
+        ct = None
+        protected = True
+        reason = "unavailable"
+        if proc is not None:
             try:
-                proc = psutil.Process(p)
-            except psutil.NoSuchProcess:
-                continue
+                ct = proc.create_time()
+                protected = _is_protected(_match_target(proc), pid)
+                reason = "protected" if protected else ""
+            except psutil.Error as exc:
+                reason = type(exc).__name__
+        entry = {"pid": pid, "create_time": ct, "protected": protected}
+        captured.append(entry)
+        if reason:
+            skipped.append({**entry, "reason": reason})
+        else:
+            handles[pid] = proc
+    revision = _tree_revision(captured)
+    report.update({
+        "captured": captured, "skipped": skipped, "tree_revision": revision,
+        "scope_checked": tree_revision is not None,
+    })
+    if tree_revision is not None and (revision is None or tree_revision != revision):
+        raise HTTPException(409, "Process tree changed — review its current scope before stopping")
+    signaled: list[psutil.Process] = []
+    for entry in captured:
+        proc = handles.get(entry["pid"])
+        if proc is None:
+            continue
         try:
-            if _is_protected(_match_target(proc), p):
-                continue
             proc.kill() if force else proc.terminate()
             signaled.append(proc)
-        except psutil.Error:
-            pass
+        except psutil.Error as exc:
+            skipped.append({**entry, "reason": type(exc).__name__})
+    signaled_pids = {proc.pid for proc in signaled}
+    report["signaled"] = [entry for entry in captured if entry["pid"] in signaled_pids]
     return signaled
 
 
-@app.get("/api/tree/{pid}")
-def agent_tree(pid: int) -> dict:
-    """The processes inside an agent's subtree — what a kill would actually hit.
-
-    Authorized exactly like kill: only a recognized agent root may be inspected,
-    so the endpoint can't be used to walk arbitrary process trees.
-    """
-    try:
-        proc = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        raise HTTPException(404, f"PID {pid} not found")
-    if _label_for(_match_target(proc)) is None:
-        raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
-
-    meta, children, _, procmap = _collect()
+def _tree_rows(
+    pid: int, meta: dict, children: dict, procmap: dict, measurements: dict
+) -> list[dict]:
     rows: list[dict] = []
     stack: list[tuple[int, int]] = [(pid, 0)]
     seen: set[int] = set()
@@ -1341,12 +1674,16 @@ def agent_tree(pid: int) -> dict:
         if p in seen or p not in meta:
             continue
         seen.add(p)
-        cpu, mem = _cpu_mem(p, procmap)
+        cpu, mem = measurements.get(p, (0.0, 0.0))
         pr = procmap.get(p)
         rows.append(
             {
                 "pid": p,
+                "create_time": meta[p]["ct"],
                 "name": meta[p]["name"],
+                "protected": not meta[p]["ct"] or _is_protected(
+                    _match_target(pr) if pr else meta[p]["name"], p
+                ),
                 "cpu_percent": round(cpu, 1),
                 "mem_mb": round(mem, 1),
                 "cmdline": (_cmdline(pr) if pr else meta[p]["name"])[:200],
@@ -1356,11 +1693,45 @@ def agent_tree(pid: int) -> dict:
         # reversed → DFS pops keep sibling order, so rows read parent-first
         for child in reversed(children.get(p, [])):
             stack.append((child, depth + 1))
-    return {"pid": pid, "tree": rows}
+    return rows
+
+
+@app.get("/api/tree/{pid}")
+def agent_tree(pid: int, create_time: Optional[float] = None) -> dict:
+    _maybe_reload_config()
+    try:
+        proc = psutil.Process(pid)
+        current_ct = proc.create_time()
+    except psutil.NoSuchProcess:
+        raise HTTPException(404, f"PID {pid} not found")
+    if _label_for(_match_target(proc)) is None:
+        raise HTTPException(403, f"PID {pid} is not a recognized agent — refusing")
+    if create_time is not None and create_time != current_ct:
+        raise HTTPException(409, "Process changed — refresh before inspecting")
+    data = list_agents()
+    with _snapshot_lock:
+        tree = copy.deepcopy(_snapshot_trees.get((pid, current_ct)))
+        sampled_at = _snapshot["ts"] if _snapshot else data["ts"]
+        sampled_agent = next(
+            (a for a in (_snapshot or data)["agents"] if a["pid"] == pid and a["create_time"] == current_ct),
+            None,
+        )
+        evidence = copy.deepcopy(sampled_agent.get("evidence")) if sampled_agent else None
+    if tree is None:
+        raise HTTPException(409, "Process is not in the current snapshot — refresh")
+    with _history_lock:
+        history = [point for point in _history.get((pid, current_ct), ()) if point[0] <= sampled_at]
+    return {
+        "pid": pid, "create_time": current_ct, "ts": sampled_at, "tree": tree,
+        "tree_revision": _tree_revision(tree), "history": history, "evidence": evidence,
+    }
 
 
 @app.post("/api/kill/{pid}")
-def kill_agent(pid: int, request: Request, force: bool = False) -> dict:
+def kill_agent(
+    pid: int, request: Request, force: bool = False,
+    create_time: Optional[float] = None, tree_revision: Optional[str] = None,
+) -> dict:
     # Caller authorization comes FIRST and is a separate question from the
     # target authorization below: the token says who may kill, the allowlist
     # re-match says what may be killed. Without this gate, every monitored
@@ -1418,27 +1789,55 @@ def kill_agent(pid: int, request: Request, force: bool = False) -> dict:
             f"auto-starting).",
         )
 
-    signaled = _signal_tree(proc, force)
+    if create_time is None:
+        _log_action(request, pid, "428 missing-process-identity")
+        raise HTTPException(428, "Send create_time from the displayed agent snapshot")
+    if not math.isfinite(create_time) or create_time != proc.create_time():
+        _log_action(request, pid, "409 process-identity-mismatch")
+        raise HTTPException(409, "Process changed — refresh before stopping")
+
+    audit = {
+        "captured": [], "signaled": [], "skipped": [], "tree_revision": None,
+        "scope_checked": False,
+    }
+    try:
+        signaled = _signal_tree(proc, force, tree_revision=tree_revision, audit=audit)
+    except HTTPException:
+        _log_action(
+            request, pid, "409 tree-identity-mismatch", create_time=create_time,
+            requested_tree_revision=tree_revision, **audit,
+        )
+        raise
     method = "kill" if force else "terminate"
     if not signaled and not proc.is_running():
         # Exited between authorization and signaling (is_running() is pid-reuse
         # aware) — report that rather than a fake "terminated".
-        _log_action(request, pid, "already exited", target=target[:120], method=method)
+        _log_action(
+            request, pid, "already exited", target=target[:120], method=method,
+            create_time=create_time, **audit,
+        )
         return {
             "pid": pid,
             "result": "already exited",
             "method": method,
             "killed": 0,
             "still_running": 0,
+            "skipped_count": len(audit["skipped"]),
+            **audit,
         }
     if not signaled:
-        _log_action(request, pid, "no processes signaled", target=target[:120], method=method)
+        _log_action(
+            request, pid, "no processes signaled", target=target[:120], method=method,
+            create_time=create_time, **audit,
+        )
         return {
             "pid": pid,
             "result": "no processes signaled",
             "method": method,
             "killed": 0,
             "still_running": 1,
+            "skipped_count": len(audit["skipped"]),
+            **audit,
         }
     gone, alive = psutil.wait_procs(signaled, timeout=3)
     if alive and not force:  # graceful terminate didn't take — escalate to kill
@@ -1450,10 +1849,17 @@ def kill_agent(pid: int, request: Request, force: bool = False) -> dict:
         more_gone, alive = psutil.wait_procs(alive, timeout=3)
         gone += more_gone
 
+    gone_pids = {p.pid for p in gone}
+    alive_pids = {p.pid for p in alive}
+    audit["stopped"] = [entry for entry in audit["signaled"] if entry["pid"] in gone_pids]
+    audit["survivors"] = [entry for entry in audit["signaled"] if entry["pid"] in alive_pids]
     result = "terminated" if not alive else "signal sent, some still running"
+    if audit["skipped"]:
+        result = "signaled processes stopped; some processes skipped" if not alive else "some processes remain or were skipped"
     _log_action(
         request, pid, result, target=target[:120], method=method,
         killed=len(gone), still_running=len(alive),
+        create_time=create_time, skipped_count=len(audit["skipped"]), **audit,
     )
     return {
         "pid": pid,
@@ -1461,6 +1867,8 @@ def kill_agent(pid: int, request: Request, force: bool = False) -> dict:
         "method": method,
         "killed": len(gone),
         "still_running": len(alive),
+        "skipped_count": len(audit["skipped"]),
+        **audit,
     }
 
 
@@ -1505,8 +1913,10 @@ def metrics() -> PlainTextResponse:
         "# TYPE aum_agent_cpu_percent gauge",
         "# HELP aum_agent_mem_mb Sum of tree RSS in MiB across instances",
         "# TYPE aum_agent_mem_mb gauge",
-        "# HELP aum_agent_restarts_10m Short-lived deaths under this label in the last 10 minutes",
+        "# HELP aum_agent_restarts_10m Short-lived supervised exits in the last 10 minutes",
         "# TYPE aum_agent_restarts_10m gauge",
+        "# HELP aum_runtime_short_lived_exits_10m Uncorrelated short-lived exits across a runtime",
+        "# TYPE aum_runtime_short_lived_exits_10m gauge",
         "# HELP aum_agent_flag Sustained-state flag is currently raised (hot/idle/churn/leak)",
         "# TYPE aum_agent_flag gauge",
     ]
@@ -1523,6 +1933,9 @@ def metrics() -> PlainTextResponse:
             )
         if d["has_gpu"]:
             out.append(f'aum_agent_gpu_mem_mb{{agent="{ql}"}} {d["gpu"]:.1f}')
+    for runtime in data["runtime_exits"]:
+        label = _prom_escape(runtime["runtime"])
+        out.append(f'aum_runtime_short_lived_exits_10m{{runtime="{label}"}} {runtime["short_lived_exits"]}')
     out += [
         "# HELP aum_agents Total matched agent instances",
         "# TYPE aum_agents gauge",
@@ -1541,7 +1954,7 @@ def metrics() -> PlainTextResponse:
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(BASE / "static" / "index.html")
+    return FileResponse(BASE / "static" / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")

@@ -136,18 +136,30 @@ alerts:
   cooldown: 600
   flags: [hot, churn, leak]
   leak_floor_mb: 1536
+  dashboard_url: http://127.0.0.1:8765
 ```
 
 The command runs through the shell with:
 
-- `AUM_MSG`
+- `AUM_TITLE` — plain-language verdict with measured warning evidence
+- `AUM_MSG` — verdict followed by the resource summary and optional inspection URL
 - `AUM_LABEL`
 - `AUM_FLAG`
 - `AUM_PID`
+- `AUM_CREATE_TIME` — exact process creation time
+- `AUM_EVENT_ID` — retained warning identifier, when available
+- `AUM_INSPECT_PATH` — relative warning or exact-process URL
+- `AUM_INSPECT_URL` — full inspection URL when `dashboard_url` is configured
 - `AUM_CPU`
 - `AUM_MEM_MB`
 - `AUM_RESTARTS`
 - `AUM_HOST`
+
+`dashboard_url` is optional. Set it to an HTTP(S) origin reachable by the alert
+recipient; localhost links work only on the machine running AUM. A saved-warning
+link opens the original observation, with an explicit transition to the exact
+current process when it still exists. The delivery state records the configured
+command's result; downstream notification receipts belong to that command.
 
 Alerts fire when a state appears, not on every poll. Cooldown is tracked per
 agent and flag and is charged only after the command exits successfully.
@@ -166,10 +178,10 @@ The one-shot `list` command never sends alerts.
 
 | State | Meaning |
 |---|---|
-| `hot` | At least 90% of one CPU core for five minutes |
-| `idle` | A long-running process stays below the idle threshold for ten minutes |
-| `churn` | The same label dies young at least three times in ten minutes |
-| `leak?` | RSS rises at least 30% and 128 MB over fifteen minutes without falling back |
+| `hot` | Mean CPU is at least 90% of one core across five minutes |
+| `idle` | Ten-minute p95 CPU is below 2% of one core |
+| `churn` | The same launchd service has at least three short-lived exits in ten minutes |
+| `leak?` | RSS rises at least 30% and 128 MB over a fifteen-minute window, with that condition holding for another fifteen minutes |
 
 These are investigation hints, not diagnoses. Inference can be legitimately
 hot, waiting agents can be legitimately idle, and conversational agents can
@@ -177,6 +189,11 @@ grow memory as session state grows.
 
 History lives in memory and rebuilds after restart. `list` and `list --json`
 are one-shot commands, so their output sets `flags_available` to false.
+The dashboard retains the first observation of at most 100 warnings for up to
+48 hours, including its measured evidence and CPU/RSS samples. A restart or the
+count cap can remove a warning before its maximum retention deadline.
+Unsupervised exits appear once per runtime as short-lived exits across sessions;
+they do not label every live session as restarted or crash-looping.
 
 ## launchd-supervised agents
 
@@ -209,35 +226,78 @@ Returns host totals and matched agents:
 
 ```text
 { api_version, aum_version, agents, host, cpu_count, mem_total_mb,
-  mem_used_pct, config_path, config_error, ts }
+  mem_used_pct, config_path, config_error, token_path, ts,
+  sample_interval_s, sample_age_s, runtime_exits, alert_deliveries, events }
 ```
 
 Each agent includes its PID, creation time, label, resource totals, CPU trend,
 states, protection status, and supervised-process guidance. Pair `pid` with
 `create_time` when caching rows so PID reuse cannot alias two processes.
+API version 2 adds `runtime`, `instance_id`, `project`, `runtime_exits`, and
+`alert_deliveries`, plus warning `evidence`, `event_id`, and retained `events`.
+Server reads share one three-second sampler; failed
+collection or a sample older than ten seconds returns 503.
+
+The inspector's project name comes from the process's working-directory basename.
+It is a navigation aid, not verified repository or task identity. Unavailable
+directories remain explicit; the API does not expose the full directory path.
+
+Alert commands that fail to start or exit nonzero retry after five and ten
+seconds while the condition persists, for three attempts total. Delivery
+status distinguishes pending, sending, retry, delivered, failed, and unconfirmed.
+An unconfirmed sixty-second timeout does not retry automatically.
 
 ### `GET /api/tree/{pid}`
 
 Returns the recognized agent's process subtree with per-child resource and
 command information.
+Send `create_time` from the row to pin its identity; mismatches return 409.
+Tree values come from the same collector as the main table.
+The response includes CPU/RSS `history`, measured `evidence`, and a nullable
+`tree_revision` covering each captured PID, creation time, and protection state.
+Pass that revision with a stop request to check that the reviewed scope still
+matches before any signal. An unreadable identity leaves the revision unavailable.
+
+### `GET /api/events` and `GET /api/events/{event_id}`
+
+The list returns warning summaries and `retention_s`. A detail response adds
+the frozen onset `agent` and `history`, along with `observed_at`, `retained_until`,
+`last_observed_at`, `ended_at`, and `status` (`active`, `cleared`, or
+`not_observed`). Missing or evicted observations return HTTP 404.
+
+Open `/?event=<id>` for a saved warning or `/?pid=<pid>&create_time=<value>`
+for an exact current process. A saved view is read-only; it never selects a
+replacement process after PID reuse.
 
 ### `GET /metrics`
 
 Returns Prometheus text exposition aggregated by label rather than PID.
 
-### `POST /api/kill/{pid}?force=false`
+### `POST /api/kill/{pid}?force=false&create_time=...&tree_revision=...`
 
 Sends SIGTERM to a recognized process tree; `force=true` sends SIGKILL. The
-request must include the token:
+request must include the token and exact creation time from the displayed
+`/api/agents` row. The timestamp below is illustrative; use the returned value:
 
 ```bash
 curl -X POST \
   -H "X-Kill-Token: $(cat "$HOME/Library/Application Support/agent-usage-manager/kill_token")" \
-  http://127.0.0.1:8765/api/kill/48213
+  'http://127.0.0.1:8765/api/kill/48213?create_time=1710000000.125'
 ```
 
 The token path differs on non-macOS platforms and is named in the server's 403
 response. Never paste the token into an issue or screenshot.
+An actionable request without creation time returns 428. If the PID now
+belongs to another process, the request returns 409 without signaling it.
+Refresh older browser clients before using stop controls.
+
+The dashboard sends `tree_revision` from the tree it displayed. A changed or
+unreadable scope returns 409 before signaling. Clients that omit the optional
+revision still get the root creation-time check, without reviewed-tree comparison.
+Process trees can change after comparison; this is not an atomic operating-system
+tree-stop operation. Results and the action log report captured, signaled,
+skipped, stopped, and surviving identities, with `scope_checked` indicating
+whether a revision comparison was attempted.
 
 ## Run as a user service
 
