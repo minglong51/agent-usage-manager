@@ -94,6 +94,9 @@ class FakeProc:
     def create_time(self) -> float:
         return self._ct
 
+    def cwd(self) -> str:
+        return "/tmp/aum-test-project"
+
     def terminate(self) -> None:
         self.signaled.append("terminate")
 
@@ -137,7 +140,7 @@ def _cleanup_label(label: str, pids: tuple) -> None:
         m._prev_flag.pop(label, None)
 
 
-def test_crash_looper_caught_by_label_churn(monkeypatch):
+def test_unsupervised_exits_are_runtime_facts(monkeypatch):
     monkeypatch.setattr(m, "_cached", lambda key, ttl, fn: {})
     monkeypatch.setattr(m, "_cpu_mem", lambda pid, procmap: (2.0, 64.0))
     pids = (91000, 91001, 91002, 91003, 91004)
@@ -146,21 +149,17 @@ def test_crash_looper_caught_by_label_churn(monkeypatch):
         for pid in pids:
             proc = FakeProc(pid, ["vllm", "serve"], ct=time.time() - 2.0)
             monkeypatch.setattr(m, "_collect", lambda p=proc: _fake_table([p]))
-            row = next(
-                a for a in m.list_agents()["agents"] if a["pid"] == pid
-            )
+            data = m.list_agents()
+            row = next(a for a in data["agents"] if a["pid"] == pid)
             assert row["label"] == "vllm"
             observed.append((row["flag"], row["restarts"]))
-        assert observed == [
-            (None, 0),
-            (None, 0),
-            (None, 1),
-            (None, 2),
-            ("churn", 3),
-        ]
-        assert m._restarts_in_window("vllm", time.time()) == 4
+        assert observed == [(None, 0)] * len(pids)
+        assert data["runtime_exits"] == [{
+            "runtime": "vllm", "short_lived_exits": 4,
+            "last_exit": m._last_death_in_window("runtime:vllm", time.time()),
+        }]
     finally:
-        _cleanup_label("vllm", pids)
+        _cleanup_label("runtime:vllm", pids)
 
 
 def test_leaker_flag_surfaces_in_api_row(monkeypatch):
@@ -350,7 +349,8 @@ def test_kill_launchd_supervised_409(client, action_log, monkeypatch, sleeper):
 def test_kill_terminates_real_process(client, action_log, monkeypatch, sleeper):
     monkeypatch.setattr(m, "_match_target", lambda p: "ollama serve")
     monkeypatch.setattr(m, "_cached", lambda key, ttl, fn: {})
-    r = client.post(f"/api/kill/{sleeper.pid}", headers=TOKEN)
+    ct = m.psutil.Process(sleeper.pid).create_time()
+    r = client.post(f"/api/kill/{sleeper.pid}", params={"create_time": ct}, headers=TOKEN)
     assert r.status_code == 200
     body = r.json()
     assert body["result"] == "terminated"

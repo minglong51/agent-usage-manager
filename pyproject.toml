@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-usage-manager"
-version = "0.2.6"
+version = "0.3.0"
 description = "Local htop-style dashboard and guarded kill switch for headless AI-agent processes."
 readme = "README.md"
 license = { text = "MIT" }

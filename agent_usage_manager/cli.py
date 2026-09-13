@@ -134,10 +134,15 @@ def _run_test_alert() -> int:
     )
     env = {
         **os.environ,
+        "AUM_TITLE": "Test alert — agent-usage-manager alert wiring works",
         "AUM_MSG": msg,
         "AUM_LABEL": "test",
         "AUM_FLAG": "test",
         "AUM_PID": str(os.getpid()),
+        "AUM_CREATE_TIME": "",
+        "AUM_EVENT_ID": "",
+        "AUM_INSPECT_PATH": "",
+        "AUM_INSPECT_URL": "",
         "AUM_CPU": "0.0",
         "AUM_MEM_MB": "0",
         "AUM_RESTARTS": "0",

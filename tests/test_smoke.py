@@ -1,5 +1,8 @@
 import os
-import re
+import shutil
+import subprocess
+from html.parser import HTMLParser
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -125,27 +128,35 @@ def test_index_serves(client):
     assert client.get("/").status_code == 200
 
 
-def test_index_frontend_regressions(client):
-    # Static contracts behind the 2026-08-24 dogfood frontend fixes (there is
-    # no JS test runner here; these pin the served page's behavior-bearing
-    # markup so the fixed paths can't silently regress).
-    html = client.get("/").text
-    # A denied clipboard write must say so, not fail silently (bug #1).
-    copy_fn = re.search(r"function copyHint\(.*?\n\}", html, re.S)
-    assert copy_fn, "copyHint not found in served page"
-    assert ".catch(" in copy_fn.group(0)
-    assert "copy failed" in copy_fn.group(0)
-    # Mid-width dead zone (bug #2): the actions column is sticky-pinned to the
-    # right edge so the kill verb is reachable while .wrap scrolls.
-    assert "position: sticky" in html
-    assert 'class="c-act"' in html
-    # Phone stack (F1/F2/F3): numbers carry their units, child rows keep the
-    # cmdline that is their only identity, and the launchd hint clips its
-    # identical 'launchctl …' prefix (rtl) instead of the job label.
-    assert '<span class="unit">%</span>' in html
-    assert '<span class="unit"> MB</span>' in html
-    assert "tr.child td.c-cmd" in html
-    assert "direction: rtl" in html
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is required for frontend logic tests")
+def test_frontend_logic():
+    result = subprocess.run(
+        [shutil.which("node"), "--test", str(Path(__file__).with_name("test_frontend.js"))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_index_has_accessible_inspection_and_confirmation(client):
+    class Elements(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.elements = []
+
+        def handle_starttag(self, tag, attrs):
+            self.elements.append((tag, dict(attrs)))
+
+    page = Elements()
+    page.feed(client.get("/").text)
+    elements = page.elements
+    assert any(tag == "input" and attrs.get("type") == "search" and attrs.get("aria-label")
+               for tag, attrs in elements)
+    assert any(tag == "aside" and attrs.get("aria-label") for tag, attrs in elements)
+    dialog = next(attrs for tag, attrs in elements if tag == "dialog")
+    label = dialog["aria-labelledby"]
+    assert any(tag in ("h1", "h2", "h3") and attrs.get("id") == label for tag, attrs in elements)
+    assert any(attrs.get("role") == "alert" for _, attrs in elements)
+    assert any(attrs.get("role") == "status" for _, attrs in elements)
 
 
 def test_kill_pid1_refused(client):
@@ -237,13 +248,15 @@ def test_csrf_guard_blocks_null_origin_kill(client):
 
 def test_api_agents_has_system_fields(client):
     body = client.get("/api/agents").json()
-    assert body["api_version"] == 1
+    assert body["api_version"] == 2
     assert body["aum_version"]
     assert body["config_path"]
     assert body["mem_total_mb"] > 0
     for a in body["agents"]:
         assert "trend" in a and "flag" in a
         assert "create_time" in a
+        assert isinstance(a["project"], str)
+        assert a["runtime"] and a["instance_id"]
 
 
 def test_tree_refuses_non_agent(client):
@@ -509,7 +522,7 @@ def test_alert_message_is_verdict_first():
     # not the source tag; the full snapshot trails in brackets.
     a = _agent("codex", "churn", restarts=4, cpu_percent=5.0, mem_mb=34.0, pid=1688)
     msg = m._alert_message(a, "mini.local")
-    assert msg.startswith("Codex is crash-looping — 4 restarts in 10 min")
+    assert msg.startswith("Codex has 4 short-lived service exits in 10 min — inspect its logs")
     assert "[agent-usage-manager · churn · mini.local · cpu 5% · mem 34MB" in msg
     assert "pid 1688" in msg and "restarts(10m) 4" in msg
     assert "\n" not in msg  # AUM_MSG is a documented one-liner (passed to --title)
